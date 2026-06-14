@@ -2,7 +2,7 @@ const { kord, wtype, prefix, config, getData, storeData, isAdmin } = require("..
 const { MongoClient } = require("mongodb")
 const triviaData = require("./data/trivia.json")
 const scrambleData = require("./data/scramble.json")
-
+const pre = prefix
 
 
 const MONGO_URI = config().MONGODB_URI || config().ECONOMY_MONGO || ""
