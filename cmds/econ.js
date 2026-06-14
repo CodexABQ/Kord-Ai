@@ -11,7 +11,13 @@ let _econClient = null
 
 async function getEconDB() {
   if (_econDB) return _econDB
-  if (!MONGO_URI) throw new Error("MONGODB_URI not set in config")
+  
+  if (!MONGO_URI) {
+    console.error("❌ MONGODB_URI not set!")
+    throw new Error("MONGODB_URI not set in config")
+  }
+  
+  console.log("🔄 Connecting to MongoDB...")
   _econClient = new MongoClient(MONGO_URI, { tls: true, serverSelectionTimeoutMS: 8000 })
   await _econClient.connect()
   _econDB = _econClient.db()
