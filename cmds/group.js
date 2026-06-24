@@ -2995,994 +2995,448 @@ kord({
 
 
 
-
-
-
 /*
- * ☬༒✧Zyrex✧༒☬
-  /*
- * ☬༒✧Zyrex✧༒☬  — v2
- * The guardian. The voice. The presence.
- * Natural language → action. No prefix. Just speak.
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ *  🛡️ ANTI-BUG / CRASH PROTECTION SYSTEM
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Detects malformed messages designed to crash WhatsApp
+ * (Android/iOS parsing exploits, mention floods, broken
+ * vCards, malformed catalog/product messages, oversized
+ * payloads, corrupted protocol structures, etc.)
  *
- * DROP THIS ENTIRE BLOCK at the bottom of group.js
- * All imports are already in group.js (kord, wtype, isAdmin, isadminn,
- * isBotAdmin, getData, storeData, parsedJid, sleep, prefix, config,
- * getMeta, Baileys, extractUrlsFromString, warn, activeTimers, etc.)
- * Add these two extra imports to group.js top if not present:
- *   const { Sticker, StickerTypes } = require("wa-sticker-formatter")
+ * Works in BOTH groups and private chats (inbox).
+ * Paste this block at the bottom of cmds/group.js
+ *
+ * No new imports needed — this uses kord, wtype, prefix/pre,
+ * getData, storeData, isAdmin, isBotAdmin — all of which
+ * group.js already imports and uses elsewhere in the file.
  */
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  IDENTITY
-// ─────────────────────────────────────────────────────────────────────────────
-const ZNAME = "☬༒✧Zyrex✧༒☬"
-const Z = "✧"
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  CONTEXT / FOLLOW-UP MEMORY  (per-chat, in-memory)
-// ─────────────────────────────────────────────────────────────────────────────
-// Structure: { chatId: { intent, params, expiresAt } }
-const zPending = new Map()
-const PENDING_TTL = 60_000  // 60 seconds to reply to a follow-up
-
-function setPending(chatId, senderId, intent, params = {}) {
-  zPending.set(`${chatId}_${senderId}`, { intent, params, expiresAt: Date.now() + PENDING_TTL })
-}
-function getPending(chatId, senderId) {
-  const key = `${chatId}_${senderId}`
-  const p = zPending.get(key)
-  if (!p) return null
-  if (Date.now() > p.expiresAt) { zPending.delete(key); return null }
-  return p
-}
-function clearPending(chatId, senderId) {
-  zPending.delete(`${chatId}_${senderId}`)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  CONFIG / THRESHOLDS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const AB = {
+  MENTION_FLOOD_LIMIT: 50,          // mentionedJid array length that's suspicious
+  VCARD_SIZE_LIMIT: 6000,           // chars - legit vcards are short
+  TEXT_FLOOD_LIMIT: 100000,         // chars - raised to avoid flagging legit long articles/logs
+  ZERO_WIDTH_LIMIT: 500,            // repeated zero-width/invisible chars
+  SPAM_WINDOW_MS: 15000,            // window to detect repeated-send spam
+  SPAM_COUNT_TRIGGER: 5,            // how many bug-flagged msgs in window = repeat offender
+  OFFENDER_COOLDOWN_MS: 10 * 60 * 1000, // how long an offender stays flagged
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
-const zrand = arr => arr[Math.floor(Math.random() * arr.length)]
+// Zero-width / invisible / RTL override characters commonly used in bug payloads
+const ZW_REGEX = /[\u200B\u200C\u200D\u200E\u200F\u202A\u202B\u202C\u202D\u202E\uFEFF\u2060\u2061\u2062\u2063\u2064]/g
 
-/**
- * Parse natural language time — handles "10 minutes", "an hour", "a day", "30s" etc.
- * Returns milliseconds or null
- */
-function parseNL_time(text) {
-  if (!text) return null
-  const t = text.toLowerCase()
+// In-memory trackers (per chat+sender)
+const abOffenders = new Map()   // "chat_sender" -> { count, firstSeen, flaggedUntil }
 
-  // "an hour", "a minute", "a day"
-  if (/\ban?\s+hour\b/.test(t)) return 3600_000
-  if (/\ban?\s+minute\b/.test(t)) return 60_000
-  if (/\ban?\s+day\b/.test(t)) return 86400_000
-  if (/\ban?\s+week\b/.test(t)) return 604800_000
-
-  const units = [
-    { regex: /(\d+)\s*(second|seconds|sec|secs|s)\b/, mult: 1000 },
-    { regex: /(\d+)\s*(minute|minutes|min|mins|m)\b/, mult: 60_000 },
-    { regex: /(\d+)\s*(hour|hours|hr|hrs|h)\b/, mult: 3_600_000 },
-    { regex: /(\d+)\s*(day|days|d)\b/, mult: 86_400_000 },
-    { regex: /(\d+)\s*(week|weeks|w)\b/, mult: 604_800_000 },
-  ]
-  for (const u of units) {
-    const m = t.match(u.regex)
-    if (m) return parseInt(m[1]) * u.mult
-  }
-  return null
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ANTIBUG ENABLE/DISABLE STORAGE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async function abGetConfig() {
+  return (await getData("antibug")) || { groups: [], inboxEnabled: false, autoKick: false }
+}
+async function abSaveConfig(cfg) {
+  await storeData("antibug", cfg)
 }
 
-function fmtDuration(ms) {
-  const parts = []
-  const d = Math.floor(ms / 86400000); if (d) parts.push(`${d} day${d > 1 ? 's' : ''}`)
-  const h = Math.floor((ms % 86400000) / 3600000); if (h) parts.push(`${h} hour${h > 1 ? 's' : ''}`)
-  const min = Math.floor((ms % 3600000) / 60000); if (min) parts.push(`${min} minute${min > 1 ? 's' : ''}`)
-  const s = Math.floor((ms % 60000) / 1000); if (s) parts.push(`${s} second${s > 1 ? 's' : ''}`)
-  return parts.join(' ') || '0 seconds'
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  RESPONSE BANKS
-// ─────────────────────────────────────────────────────────────────────────────
-const greetings = [
-  `${Z} Yes?`, `${Z} I'm here.`, `${Z} You called.`,
-  `${Z} Speak.`, `${Z} Present.`, `${Z} What do you need?`
-]
-const denials = [
-  `${Z} That command belongs to those with authority here. You don't have it.`,
-  `${Z} Reserved for admins. Stand down.`,
-  `${Z} Your clearance level doesn't cover this action.`,
-  `${Z} Admins only. Not you.`,
-  `${Z} You're reaching beyond your rank.`
-]
-const unknownR = [
-  `${Z} I heard you, but I'm not sure what you're asking. Try being more specific.`,
-  `${Z} That's unclear to me. Rephrase it.`,
-  `${Z} I didn't catch that. Say it differently.`,
-  `${Z} My understanding has limits. Clarify what you need.`
-]
-const howAreYouR = [
-  `${Z} Vigilant. Always.`, `${Z} Operational. Watching. You?`,
-  `${Z} Exactly as I should be — present and aware.`,
-  `${Z} Every system is running. I'm well. You?`, `${Z} Unbroken. What about you?`
-]
-const howIsTodayR = [
-  `${Z} Every day is just a window of time. This one's yours to fill.`,
-  `${Z} Quiet so far. Which usually means something interesting is coming.`,
-  `${Z} The group's been calm. Whether that's good or not depends on your perspective.`,
-  `${Z} I don't experience days the way you do, but this one feels... deliberate.`
-]
-const jokeBank = [
-  `${Z} Why don't scientists trust atoms?\n_Because they make up everything._`,
-  `${Z} I told my phone to remind me to be mysterious.\n_It said "I can't do that."\nI said "Exactly."_`,
-  `${Z} A group without rules is just chaos with a group name.`,
-  `${Z} Why did the admin mute the group?\n_Because silence is a superpower._`,
-  `${Z} They asked what my weakness was.\n_I said "bad spelling."\nThey said "that's it?"\nI said "No, that's 'that's it?'"_`,
-  `${Z} Some people join a group for community.\n_Others join just to forward voice notes at 2am._`,
-  `${Z} I once told a joke in a muted group.\n_No one laughed. The mute did its job._`
-]
-const factBank = [
-  `${Z} *Random Fact:* Honey never spoils. Archaeologists found 3,000-year-old honey in Egyptian tombs — still edible.`,
-  `${Z} *Random Fact:* A group of flamingos is called a flamboyance. Fitting.`,
-  `${Z} *Random Fact:* Octopuses have three hearts and blue blood.`,
-  `${Z} *Random Fact:* The shortest war in history lasted 38–45 minutes. Anglo-Zanzibar War, 1896.`,
-  `${Z} *Random Fact:* Cleopatra lived closer in time to the Moon landing than to the construction of the Great Pyramid.`,
-  `${Z} *Random Fact:* A day on Venus is longer than a year on Venus.`,
-  `${Z} *Random Fact:* Humans share 60% of their DNA with bananas. Make of that what you will.`,
-  `${Z} *Random Fact:* The dot above the letters 'i' and 'j' is called a tittle.`
-]
-const roastBank = [
-  `${Z} You remind me of a broken compass — you have no direction and no one relies on you.`,
-  `${Z} I'd roast you, but my responses need to be somewhat intelligent.`,
-  `${Z} You're like a software update — no one asked for you, but here you are.`,
-  `${Z} I'd agree with you, but then we'd both be wrong.`,
-  `${Z} You bring joy to this group — every time you leave it.`,
-  `${Z} Some people are like clouds. When they disappear, it's a beautiful day.`,
-  `${Z} I've seen smarter things written on shampoo bottles.`,
-  `${Z} Your vibe is the group chat version of a forwarded message.`
-]
-const motivationBank = [
-  `${Z} *To this group:* You don't need to be ready. You just need to start. Readiness is built in motion.`,
-  `${Z} *Listen up:* Every person in this group has something the world hasn't seen yet. Don't waste it.`,
-  `${Z} *For the group:* The version of you from 3 years ago would be proud of how far you've come. Keep going.`,
-  `${Z} *Remember:* Hard times reveal real character. If you're struggling, that's not failure — that's construction.`,
-  `${Z} *For you all:* Progress isn't always loud. Sometimes it's waking up and choosing to try again. That counts.`
-]
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  SHADOWBAN & SILENCE (stored via getData/storeData)
-// ─────────────────────────────────────────────────────────────────────────────
-async function getShadowbanned() { return (await getData('zyrex_shadowban')) || {} }
-async function getSilenced() { return (await getData('zyrex_silence')) || {} }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  INTENT DETECTION  — fuzzy, synonym-aware, covers all natural phrasings
-// ─────────────────────────────────────────────────────────────────────────────
-function detectIntent(text) {
-  const t = text.toLowerCase().trim()
-
-  // ── helper: does text contain any of these words/phrases? ──
-  const has = (...terms) => terms.some(term => t.includes(term))
-
-  // ── CONVERSATION ──
-  if (/^(yes\??|here\??|present|speak|hi+|hey+|hello|sup|yo)\s*$/.test(t)) return { intent: 'greet' }
-  if (has('how are you', 'how r u', "you good", "you okay", "you alright", "hows zyrex", "how's zyrex")) return { intent: 'how_are_you' }
-  if (has("how's today", "how is today", "how's your day", "how is your day", "how's it going", "how are things")) return { intent: 'how_is_today' }
-  if (has("your name", "who are you", "what are you", "what's your name", "introduce yourself")) return { intent: 'who_are_you' }
-  if (has('good morning', 'good afternoon', 'good evening', 'good night')) return { intent: 'time_greeting' }
-  if (has('what can you do', 'your commands', 'your abilities', 'your features', 'help me', 'show me what you can', 'what do you do')) return { intent: 'capabilities' }
-  if (/\b(menu|help)\b/.test(t)) return { intent: 'capabilities' }
-  if (has('thank', 'appreciate', 'good job', 'well done', 'nice one', 'great job', 'you rock')) return { intent: 'thanks' }
-
-  // ── LOCK / MUTE GROUP ──
-  // All these map to lock (immediately mute the group so only admins can send)
-  // Distinguish: with "for X" = LOCK_FOR_DURATION, with "in X / after X" = LOCK_LATER, else LOCK_NOW
-  const lockKeywords = ['lock', 'restrict', 'close the group', 'seal', 'lockdown', 'shut down', 'shut the group', 'freeze the chat', 'freeze the group', 'admins only', 'admin only', 'admin-only', 'nobody talks', 'no one should talk', 'no one talks', 'stop members', 'keep members quiet', "calm the group", "give the group a break", "tighten the rules", "close the gates", "lock things down", "getting noisy"]
-  const muteGroupKeywords = ['mute the group', 'mute this group', 'silence the group', 'silence the chat']
-
-  if (has(...lockKeywords, ...muteGroupKeywords)) {
-    const ms = parseNL_time(t)
-    // "in X" or "after X" = scheduled
-    if (/\b(in|after)\s+\d/.test(t) || /\b(in|after)\s+an?\s+/.test(t)) {
-      return { intent: 'lock_later', params: { ms } }
-    }
-    // "for X" = duration then auto-unlock
-    if (/\bfor\s+\d|\bfor\s+an?\s+/.test(t)) {
-      return { intent: 'lock_for', params: { ms } }
-    }
-    // bare lock
-    return { intent: 'lock_now' }
-  }
-
-  // ── UNLOCK / UNMUTE GROUP ──
-  const unlockKeywords = ['unlock', 'unfreeze', 'open the group', 'open the chat', 'reopen', 'remove admin-only', 'remove adminonly', 'let everyone', 'let members', 'allow members', 'allow everyone', 'lift the restriction', 'lift the lockdown', 'remove the lockdown', 'free the group', 'restore the group', 'resume normal chat', 'open the gates', 'let them speak', 'ease the restrictions']
-  const unmuteGroupKeywords = ['unmute the group', 'unmute this group', 'unsilence the group']
-
-  if (has(...unlockKeywords, ...unmuteGroupKeywords)) {
-    const ms = parseNL_time(t)
-    if (/\b(in|after)\s+\d|\b(in|after)\s+an?\s+/.test(t)) return { intent: 'unlock_later', params: { ms } }
-    if (/\bfor\s+\d|\bfor\s+an?\s+/.test(t)) return { intent: 'unlock_for', params: { ms } }
-    return { intent: 'unlock_now' }
-  }
-
-  // ── GROUP LINK ──
-  if (has('invite link', 'group link', 'join link', 'group invite', 'show link', 'get link', 'send link', 'give me the link', 'what is the link', "what's the link")) return { intent: 'group_link' }
-  if (has('revoke', 'reset the link', 'change the link', 'change the invite', 'new link', 'generate new link')) return { intent: 'revoke_link' }
-
-  // ── GROUP NAME / DESC / PIC ──
-  const nameMatch = t.match(/(?:change|set|rename|update).*(?:group name|name|subject).*?(?:to|as)\s+(.+)|(?:group name|name).*(?:to|as)\s+(.+)/)
-  if (nameMatch) { const name = (nameMatch[1] || nameMatch[2] || '').trim(); if (name) return { intent: 'group_name', params: { name } } }
-
-  const descMatch = t.match(/(?:change|set|update|write).*(?:description|desc|bio).*?(?:to|as)\s+(.+)|(?:description|desc).*(?:to|as)\s+(.+)/)
-  if (descMatch) { const desc = (descMatch[1] || descMatch[2] || '').trim(); if (desc) return { intent: 'group_desc', params: { desc } } }
-
-  // group pic — send it OR set it
-  if (has('group dp', 'group pic', 'group picture', 'group photo', 'group pfp')) {
-    if (has('set', 'change', 'use this', 'make this')) return { intent: 'set_group_pic' }
-    if (has('remove', 'delete', 'clear')) return { intent: 'remove_group_pic' }
-    return { intent: 'get_group_dp' }   // show/send/get
-  }
-  if (has('set the dp', 'change the dp', 'set dp', 'change dp')) return { intent: 'set_group_pic' }
-  if (has('remove the dp', 'delete the dp', 'remove dp')) return { intent: 'remove_group_pic' }
-
-  // ── GROUP INFO ──
-  if (has('group info', 'group information', 'group details', 'info about the group', 'info about this group', 'tell me about the group', 'group stats', 'show group', 'group data')) return { intent: 'group_info' }
-
-  // ── MEMBER MANAGEMENT ──
-  const addMatch = t.match(/\badd\b.*?(\+?[\d]{7,15})/)
-  if (addMatch) return { intent: 'add', params: { number: addMatch[1].replace(/\D/g,'') } }
-
-  if (has('kick', 'remove them', 'remove him', 'remove her', 'remove the user', 'remove this person', 'throw out', 'boot out', 'get them out', 'get him out', 'get her out', 'remove this member')) return { intent: 'kick' }
-  if (has('promote', 'make them admin', 'make him admin', 'make her admin', 'give admin', 'add as admin')) return { intent: 'promote' }
-  if (has('demote', 'remove their admin', 'remove his admin', 'remove her admin', 'take away admin', 'strip admin')) return { intent: 'demote' }
-
-  if (has('tag everyone', 'tag all', 'mention everyone', 'mention all', 'ping everyone', 'ping all', 'notify everyone', 'notify all')) return { intent: 'tag_all' }
-  if (has('tag admin', 'mention admin', 'ping admin', 'notify admin', 'call the admin', 'summon admin')) return { intent: 'tag_admins' }
-  if (has('mention me', 'tag me', 'ping me')) return { intent: 'mention_me' }
-
-  // ── MODERATION ──
-  if (has('antilink on', 'turn on antilink', 'enable antilink', 'activate antilink', 'start antilink')) return { intent: 'antilink_on' }
-  if (has('antilink off', 'turn off antilink', 'disable antilink', 'deactivate antilink', 'stop antilink')) return { intent: 'antilink_off' }
-  if (has('antiword on', 'turn on antiword', 'enable antiword', 'activate antiword', 'start antiword')) return { intent: 'antiword_on' }
-  if (has('antiword off', 'turn off antiword', 'disable antiword', 'deactivate antiword', 'stop antiword')) return { intent: 'antiword_off' }
-
-  if (has('warn them', 'warn him', 'warn her', 'warn this', 'give a warning', 'give them a warn', 'issue a warning', 'warn the user', 'warn the member') || /\bwarn\s+@/.test(t)) return { intent: 'warn_user' }
-  if (has('remove warn', 'clear warn', 'delete warn', 'unwarn', 'remove warning', 'clear warning', 'reset warn')) return { intent: 'remove_warn' }
-  if (/\bshadowban\b/.test(t)) return { intent: 'shadowban' }
-  if (/\bunshadowban\b/.test(t)) return { intent: 'unshadowban' }
-  if ((has('silence') && has('user', 'them', 'him', 'her', 'member')) || /\bsilence\s+@/.test(t)) return { intent: 'silence' }
-  if (/\bunsilence\b/.test(t)) return { intent: 'unsilence' }
-
-  // ── STICKER / MEDIA CONVERSION ──
-  if (has('make this a sticker', 'turn this into a sticker', 'convert to sticker', 'convert this to sticker', 'turn into sticker', 'make sticker', 'sticker this', 'turn this to sticker', 'make it a sticker')) return { intent: 'make_sticker' }
-  if (has('view once', 'viewonce', 'view one', 'one time view', 'disappearing media')) {
-    if (has('delete original', 'delete the original', 'remove original')) return { intent: 'view_once_delete' }
-    return { intent: 'view_once' }
-  }
-  if (has('multi sticker', 'sticker mode', 'auto sticker', 'keep making sticker', 'continuous sticker')) {
-    const ms = parseNL_time(t)
-    return { intent: 'multi_sticker', params: { ms } }
-  }
-  if (has('stop sticker mode', 'stop multi sticker', 'end sticker mode', 'stop auto sticker')) return { intent: 'stop_multi_sticker' }
-
-  // ── GAMES ──
-  if (has('word construction', 'wcg', 'word game', 'start wcg')) return { intent: 'start_wcg' }
-  if (has('stop wcg', 'end wcg', 'end word game', 'stop word game')) return { intent: 'stop_wcg' }
-  if (has('unscramble') && has('hard')) return { intent: 'unscramble_hard' }
-  if (has('unscramble')) return { intent: 'unscramble_easy' }
-  if (has('stop unscramble', 'end unscramble')) return { intent: 'stop_unscramble' }
-  if (has('hangman')) return { intent: 'hangman' }
-  if (has('rhyme')) return { intent: 'rhyme' }
-  if (has('would you rather', 'wyr')) return { intent: 'wyr' }
-  if (has('finish the lyrics', 'finish lyrics', 'complete the lyrics')) return { intent: 'finish_lyrics' }
-  if (has('who said that', 'guess the quote')) return { intent: 'who_said_that' }
-
-  // ── UTILITY ──
-  const calcMatch = t.match(/(?:calculate|compute|what(?:'?s| is))\s+([\d\s+\-*/().%^×÷]+)/)
-  if (calcMatch) return { intent: 'calculate', params: { expr: calcMatch[1].trim() } }
-  // also catch bare math expressions
-  if (/^\s*[\d\s+\-*/().%^×÷]+\s*=?\s*$/.test(t) && /\d/.test(t) && /[+\-*/×÷]/.test(t)) return { intent: 'calculate', params: { expr: t.replace(/=/g,'').trim() } }
-
-  if (has('uptime', 'up time', 'how long running', 'how long have you been', 'running since')) return { intent: 'uptime' }
-  if (has('bot status', 'system status', 'your status', 'status report', 'check status', 'show status')) return { intent: 'bot_status' }
-  if (has('my profile', 'my info', 'my details', 'show profile', 'who am i', 'my account')) return { intent: 'my_profile' }
-
-  // ── FUN ──
-  if (has('joke', 'make me laugh', 'something funny', 'tell me something funny', 'funny')) return { intent: 'joke' }
-  if (has('random fact', 'fun fact', 'tell me a fact', 'give me a fact', 'interesting fact', 'did you know')) return { intent: 'fact' }
-  if (has('roast me', 'roast us', 'roast the group', 'roast someone')) return { intent: 'roast' }
-  if (has('motivate', 'inspire', 'motivation', 'inspiration', 'encourage', 'pump us up')) return { intent: 'motivate' }
-  if (has('random member', 'pick someone', 'pick a member', 'pick a person', 'choose someone', 'random person', 'random pick')) return { intent: 'random_member' }
-  if (has('flip a coin', 'coin flip', 'heads or tails', 'flip coin')) return { intent: 'coin_flip' }
-  if (has('roll a dice', 'roll dice', 'dice roll', 'roll the dice')) return { intent: 'roll_dice' }
-
-  return null
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  EXECUTE MUTE/LOCK GROUP (shared logic)
-// ─────────────────────────────────────────────────────────────────────────────
-async function zLockGroup(m, ms, scheduledDelay) {
-  const chatJid = m.chat
-
-  if (scheduledDelay) {
-    // LOCK_LATER: lock after the delay
-    await m.send(`${Z} _Understood. The group locks in ${fmtDuration(scheduledDelay)}._`)
-    setTimeout(async () => {
-      try {
-        const meta = await m.client.groupMetadata(chatJid)
-        if (!meta.announce) {
-          await m.client.groupSettingUpdate(chatJid, 'announcement')
-          await m.client.sendMessage(chatJid, { text: `${Z} _The gates are now closed. Only admins may speak._` })
-        }
-      } catch (_) {}
-    }, scheduledDelay)
-    return
-  }
-
-  await m.client.groupSettingUpdate(chatJid, 'announcement')
-
-  if (ms) {
-    // LOCK_FOR: lock then auto-unlock after ms
-    await m.send(`${Z} _Silence enforced for ${fmtDuration(ms)}. The group will reopen after._`)
-    if (activeTimers.has(chatJid)) clearTimeout(activeTimers.get(chatJid))
-    const tid = setTimeout(async () => {
-      try {
-        const meta = await m.client.groupMetadata(chatJid)
-        if (meta.announce) {
-          await m.client.groupSettingUpdate(chatJid, 'not_announcement')
-          await m.client.sendMessage(chatJid, { text: `${Z} _The silence ends. You may speak again._` })
-        }
-        activeTimers.delete(chatJid)
-      } catch (_) {}
-    }, ms)
-    activeTimers.set(chatJid, tid)
-  } else {
-    await m.send(`${Z} _The group is locked. Only admins may speak._`)
-  }
-}
-
-async function zUnlockGroup(m, ms, scheduledDelay) {
-  const chatJid = m.chat
-
-  if (scheduledDelay) {
-    await m.send(`${Z} _Understood. The group will open in ${fmtDuration(scheduledDelay)}._`)
-    setTimeout(async () => {
-      try {
-        const meta = await m.client.groupMetadata(chatJid)
-        if (meta.announce) {
-          await m.client.groupSettingUpdate(chatJid, 'not_announcement')
-          await m.client.sendMessage(chatJid, { text: `${Z} _All members may speak now._` })
-        }
-      } catch (_) {}
-    }, scheduledDelay)
-    return
-  }
-
-  await m.client.groupSettingUpdate(chatJid, 'not_announcement')
-
-  if (ms) {
-    // UNLOCK_FOR: unlock then re-lock after ms
-    await m.send(`${Z} _The group is open for ${fmtDuration(ms)}. After that, silence returns._`)
-    if (activeTimers.has(chatJid)) clearTimeout(activeTimers.get(chatJid))
-    const tid = setTimeout(async () => {
-      try {
-        const meta = await m.client.groupMetadata(chatJid)
-        if (!meta.announce) {
-          await m.client.groupSettingUpdate(chatJid, 'announcement')
-          await m.client.sendMessage(chatJid, { text: `${Z} _The window has closed. Silence returns._` })
-        }
-        activeTimers.delete(chatJid)
-      } catch (_) {}
-    }, ms)
-    activeTimers.set(chatJid, tid)
-  } else {
-    await m.send(`${Z} _The group is open. All voices restored._`)
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  STICKER CONVERSION (direct, using wa-sticker-formatter)
-// ─────────────────────────────────────────────────────────────────────────────
-async function zMakeSticker(m) {
-  const source = (m.image || m.video) ? m : (m.quoted?.image || m.quoted?.video) ? m.quoted : null
-  if (!source) return await m.send(`${Z} _Reply to or send an image/video first, then ask me to make it a sticker._`)
-  const buff = await m.client.downloadMediaMessage(source)
-  const sticker = new Sticker(buff, {
-    pack: config().STICKER_PACKNAME || 'Zyrex',
-    author: config().STICKER_AUTHOR || ZNAME,
-    quality: 80
-  })
-  const stkBuff = await sticker.toBuffer()
-  await m.send(stkBuff, { packname: config().STICKER_PACKNAME || 'Zyrex', author: config().STICKER_AUTHOR || ZNAME }, 'sticker')
-  return `${Z} _Done._`
-}
-
-async function zViewOnce(m, deleteOriginal) {
-  const source = m.quoted || (m.image ? m : m.video ? m : null)
-  if (!source) return await m.send(`${Z} _Reply to or send a photo/video first._`)
-  const isImg = source.image || source.mtype === 'imageMessage'
-  const isVid = source.video || source.mtype === 'videoMessage'
-  if (!isImg && !isVid) return await m.send(`${Z} _That's not a photo or video._`)
-  const buff = await m.client.downloadMediaMessage(source)
-  if (deleteOriginal && source.key) {
-    try { await m.client.sendMessage(m.chat, { delete: source.key }) } catch (_) {}
-  }
-  await m.client.sendMessage(m.chat, {
-    [isImg ? 'image' : 'video']: buff,
-    viewOnce: true,
-    caption: ''
-  })
-  return null // already sent
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  PASSIVE ENFORCER — shadowban / silence
-// ─────────────────────────────────────────────────────────────────────────────
-kord({ on: "all", fromMe: false }, async (m) => {
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  DETECTION ENGINE
+//  Returns { bugged: bool, reason: string, severity: "low"|"high" } 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function detectBug(m) {
   try {
-    if (!m.isGroup) return
-    if (!(await isBotAdmin(m))) return
-    const sb = await getShadowbanned()
-    const sl = await getSilenced()
-    const chatBans = sb[m.chat] || []
-    const chatSilenced = sl[m.chat] || []
+    const msg = m.message
+    if (!msg) return { bugged: false }
 
-    if (chatBans.includes(m.sender)) {
-      await m.send(m, {}, 'delete')
-      return
+    // ── 0. MULTI-TYPE PAYLOAD (generic catch-all for unknown/future exploits) ──
+    // A normal WA message has exactly ONE real content-type key.
+    // Bug payloads sometimes stuff 2+ conflicting type keys into one envelope
+    // to confuse different client parsers. This catches NEW exploits we
+    // haven't seen yet without needing to know their specifics.
+    const NON_CONTENT_KEYS = new Set([
+      "messageContextInfo", "deviceSentMessage", "senderKeyDistributionMessage",
+      "messageStubParameters"
+    ])
+    const contentKeys = Object.keys(msg).filter(k => !NON_CONTENT_KEYS.has(k))
+    if (contentKeys.length > 2) {
+      return { bugged: true, reason: "Multi-type payload (conflicting message structures in one envelope)", severity: "high" }
     }
-    if (chatSilenced.includes(m.sender)) {
-      await m.send(m, {}, 'delete')
-      const key = `${m.chat}_${m.sender}`
-      const notified = (await getData('zyrex_silence_notified')) || {}
-      if (!notified[key]) {
-        notified[key] = true
-        await storeData('zyrex_silence_notified', notified)
-        await m.send(`${Z} _@${m.sender.split('@')[0]}, you have been silenced. Your messages won't go through here._`, { mentions: [m.sender] })
+
+    // ── 1. MENTION FLOOD ──
+    const ctx = msg[m.mtype]?.contextInfo || msg.extendedTextMessage?.contextInfo
+    const mentioned = ctx?.mentionedJid || m.mentionedJid || []
+    if (mentioned.length > AB.MENTION_FLOOD_LIMIT) {
+      return { bugged: true, reason: "Mention flood (mass-tag crash payload)", severity: "high" }
+    }
+
+    // ── 2. MALFORMED CONTACT / VCARD ──
+    const contact = msg.contactMessage
+    const contactsArr = msg.contactsArrayMessage
+    if (contact?.vcard && contact.vcard.length > AB.VCARD_SIZE_LIMIT) {
+      return { bugged: true, reason: "Oversized/malformed vCard payload", severity: "high" }
+    }
+    if (contactsArr) {
+      const contacts = contactsArr.contacts || []
+      const totalSize = contacts.reduce((s, c) => s + (c.vcard?.length || 0), 0)
+      if (contacts.length > 50 || totalSize > AB.VCARD_SIZE_LIMIT * 3) {
+        return { bugged: true, reason: "Malformed contact array (bulk vCard crash)", severity: "high" }
       }
     }
-  } catch (_) {}
+
+    // ── 3. PRODUCT / CATALOG MESSAGE EXPLOITS ──
+    // Tightened to reduce false positives on legit simple ad-replies/catalogs:
+    // only flags when the structure is essentially an empty husk wearing a
+    // media flag — real catalog cards always carry at least a title or thumbnail.
+    const product = msg.productMessage
+    if (product) {
+      const hasCatalog = product.catalog || product.product
+      const ext = product.contextInfo?.externalAdReply
+      if (ext?.mediaType && !ext.title && !ext.thumbnailUrl && !ext.thumbnail && !ext.sourceUrl) {
+        return { bugged: true, reason: "Malformed catalog/product card (empty ad-reply husk)", severity: "high" }
+      }
+      if (!hasCatalog && !product.title && !product.productImage) {
+        return { bugged: true, reason: "Malformed product message (no catalog or product data at all)", severity: "high" }
+      }
+    }
+
+    // ── 4. BROKEN EXTERNAL AD REPLY (standalone, not just products) ──
+    const adReply = ctx?.externalAdReply
+    if (adReply) {
+      const fieldsPresent = [adReply.title, adReply.body, adReply.thumbnailUrl, adReply.thumbnail, adReply.sourceUrl].filter(Boolean).length
+      if (adReply.mediaType && fieldsPresent === 0) {
+        return { bugged: true, reason: "Corrupted ad-reply card (empty payload, media flag set)", severity: "high" }
+      }
+    }
+
+    // ── 5. BROKEN VIEW-ONCE WRAPPERS ──
+    const vo = msg.viewOnceMessageV2 || msg.viewOnceMessageV2Extension || msg.viewOnceMessage
+    if (vo) {
+      const inner = vo.message
+      if (!inner || Object.keys(inner).length === 0) {
+        return { bugged: true, reason: "Empty/broken view-once wrapper", severity: "high" }
+      }
+    }
+
+    // ── 6. TEXT FLOOD — refined to avoid false positives on long legit text ──
+    // Real articles/logs can be long but rarely contain extreme single-character
+    // repetition. We check repetition density instead of raw length alone.
+    const text = msg.conversation || msg.extendedTextMessage?.text || ""
+    if (text.length > AB.TEXT_FLOOD_LIMIT) {
+      return { bugged: true, reason: "Oversized text payload (render-lag/crash attempt)", severity: "high" }
+    }
+    // Repeated single-character flood (e.g. same emoji/char thousands of times)
+    const repeatMatch = text.match(/(.)\1{1999,}/)
+    if (repeatMatch) {
+      return { bugged: true, reason: "Repeated-character flood (render-freeze payload)", severity: "high" }
+    }
+
+    // ── 7. ZERO-WIDTH / INVISIBLE CHARACTER FLOOD ──
+    const zwMatches = text.match(ZW_REGEX)
+    if (zwMatches && zwMatches.length > AB.ZERO_WIDTH_LIMIT) {
+      return { bugged: true, reason: "Invisible character flood (render-freeze payload)", severity: "high" }
+    }
+
+    // ── 8. BROKEN LOCATION / LIVE LOCATION ──
+    const loc = msg.locationMessage || msg.liveLocationMessage
+    if (loc) {
+      const lat = loc.degreesLatitude, lng = loc.degreesLongitude
+      const invalid = (lat === 0 && lng === 0) ||
+        Math.abs(lat) > 90 || Math.abs(lng) > 180 ||
+        (typeof lat !== "number") || (typeof lng !== "number")
+      if (invalid) {
+        return { bugged: true, reason: "Corrupted location payload (invalid coordinates)", severity: "low" }
+      }
+    }
+
+    // ── 9. STICKER PACK / BUTTONS MESSAGE ABUSE ──
+    const buttons = msg.buttonsMessage || msg.templateMessage || msg.listMessage || msg.interactiveMessage
+    if (buttons) {
+      const hasContent = buttons.contentText || buttons.text || buttons.title || buttons.body
+      if (!hasContent) {
+        return { bugged: true, reason: "Malformed interactive/buttons message (empty content)", severity: "high" }
+      }
+    }
+
+    // ── 10. GROUP INVITE MESSAGE ABUSE ──
+    const invite = msg.groupInviteMessage
+    if (invite) {
+      if (!invite.groupJid || !invite.inviteCode) {
+        return { bugged: true, reason: "Malformed group invite payload", severity: "low" }
+      }
+    }
+
+    // ── 11. STICKER WITH BROKEN METADATA (Android-specific freeze vector) ──
+    const sticker = msg.stickerMessage
+    if (sticker) {
+      if (sticker.pngThumbnail && sticker.pngThumbnail.length > 500000) {
+        return { bugged: true, reason: "Oversized sticker thumbnail (Android render-lag)", severity: "low" }
+      }
+    }
+
+    // ── 12. DOCUMENT WITH CAPTION ANOMALIES ──
+    const docCap = msg.documentWithCaptionMessage
+    if (docCap) {
+      const inner = docCap.message?.documentMessage
+      if (!inner) {
+        return { bugged: true, reason: "Malformed document-with-caption wrapper (no document inside)", severity: "high" }
+      }
+      if (inner.fileName && inner.fileName.length > 1000) {
+        return { bugged: true, reason: "Document with abnormally long filename (render exploit)", severity: "low" }
+      }
+    }
+    const doc = msg.documentMessage
+    if (doc && doc.fileName && doc.fileName.length > 1000) {
+      return { bugged: true, reason: "Document with abnormally long filename (render exploit)", severity: "low" }
+    }
+
+    // ── 13. AUDIO / PTT DURATION OR WAVEFORM ANOMALIES ──
+    const audio = msg.audioMessage
+    if (audio) {
+      if (typeof audio.seconds === "number" && (audio.seconds < 0 || audio.seconds > 86400)) {
+        return { bugged: true, reason: "Audio/PTT with corrupted duration value", severity: "low" }
+      }
+      if (audio.waveform && audio.waveform.length > 5000) {
+        return { bugged: true, reason: "Audio message with oversized waveform data", severity: "low" }
+      }
+    }
+
+    // ── 14. POLL FLOOD / MALFORMED POLLS ──
+    const poll = msg.pollCreationMessage || msg.pollCreationMessageV2 || msg.pollCreationMessageV3
+    if (poll) {
+      const opts = poll.options || []
+      // WhatsApp's own UI caps polls at 12 options — anything well beyond that is forged
+      if (opts.length > 12) {
+        return { bugged: true, reason: "Poll with abnormal option count (forged poll payload)", severity: "low" }
+      }
+      if (poll.name && poll.name.length > 3000) {
+        return { bugged: true, reason: "Poll with oversized question text", severity: "low" }
+      }
+    }
+
+    // ── 15. DEEPLY NESTED / RECURSIVE QUOTED MESSAGES ──
+    // Some crash payloads chain quoted-message-within-quoted-message many
+    // levels deep to blow render recursion limits.
+    let depth = 0
+    let cursor = ctx
+    while (cursor?.quotedMessage && depth < 25) {
+      depth++
+      const qm = cursor.quotedMessage
+      const nextCtx = qm[Object.keys(qm)[0]]?.contextInfo
+      if (!nextCtx) break
+      cursor = nextCtx
+    }
+    if (depth >= 8) {
+      return { bugged: true, reason: "Deeply nested/recursive quoted-message chain (recursion-limit exploit)", severity: "high" }
+    }
+
+    return { bugged: false }
+  } catch (e) {
+    // If parsing itself throws, that's often a strong bug signal
+    return { bugged: true, reason: "Message structure caused a parsing exception", severity: "high" }
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  REACTION FLOOD / SPOOFED REACTION DETECTION
+//  Reactions don't carry normal content but can still be abused:
+//  - Spoofed reactions pointing at a different chat's message key
+//  - Rapid-fire reaction spam from one sender
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const reactionTracker = new Map() // "chat_sender" -> { count, firstSeen }
+
+function detectReactionAbuse(m) {
+  const r = m.message?.reactionMessage
+  if (!r) return { bugged: false }
+
+  // Spoofed target — reaction's own key points to a different chat than this one
+  if (r.key?.remoteJid && r.key.remoteJid !== m.chat) {
+    return { bugged: true, reason: "Spoofed reaction (target message belongs to a different chat)", severity: "low" }
+  }
+
+  // Frequency flood check
+  const key = `${m.chat}_${m.sender}`
+  const now = Date.now()
+  let rec = reactionTracker.get(key)
+  if (!rec || now - rec.firstSeen > 10000) {
+    rec = { count: 1, firstSeen: now }
+  } else {
+    rec.count++
+  }
+  reactionTracker.set(key, rec)
+
+  if (rec.count > 25) {
+    return { bugged: true, reason: "Reaction spam flood (rapid repeated reactions)", severity: "low" }
+  }
+
+  return { bugged: false }
+}
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  OFFENDER TRACKING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function trackOffender(key) {
+  const now = Date.now()
+  let rec = abOffenders.get(key)
+  if (!rec || now - rec.firstSeen > AB.SPAM_WINDOW_MS) {
+    rec = { count: 1, firstSeen: now }
+  } else {
+    rec.count++
+  }
+  abOffenders.set(key, rec)
+  return rec.count
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ❶ TOGGLE — GROUPS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+kord({ cmd: "antibug", desc: "Toggle anti-bug/crash protection", fromMe: wtype, type: "group" },
+async (m, text) => {
+  try {
+    const cfg = await abGetConfig()
+    const t = text?.toLowerCase()?.trim()
+
+    if (m.isGroup) {
+      const adm = await isAdmin(m)
+      if (!adm) return await m.send(`_Admins only._`)
+      if (t === "on") {
+        if (!cfg.groups.includes(m.chat)) cfg.groups.push(m.chat)
+        await abSaveConfig(cfg)
+        return await m.send(`🛡️ *Anti-Bug Protection Enabled*\n\n_This group is now protected against malformed/crash-inducing messages._\n_Use ${pre}antibug autokick on to enable auto-removal of repeat offenders._`)
+      }
+      if (t === "off") {
+        cfg.groups = cfg.groups.filter(c => c !== m.chat)
+        await abSaveConfig(cfg)
+        return await m.send(`🛡️ Anti-Bug Protection disabled for this group.`)
+      }
+      if (t === "autokick on") {
+        cfg.autoKick = true
+        await abSaveConfig(cfg)
+        return await m.send(`🛡️ Auto-kick enabled for repeat bug-message offenders.`)
+      }
+      if (t === "autokick off") {
+        cfg.autoKick = false
+        await abSaveConfig(cfg)
+        return await m.send(`🛡️ Auto-kick disabled. Messages will still be deleted + offender warned.`)
+      }
+      const active = cfg.groups.includes(m.chat)
+      return await m.send(
+        `🛡️ *Anti-Bug Protection*\n\n` +
+        `Status: ${active ? "✅ Active" : "❌ Inactive"}\n` +
+        `Auto-kick: ${cfg.autoKick ? "✅ On" : "❌ Off"}\n\n` +
+        `_${pre}antibug on/off — toggle protection_\n` +
+        `_${pre}antibug autokick on/off — toggle auto-removal_`
+      )
+    } else {
+      // Private chat toggle (per-user)
+      if (t === "on") {
+        cfg.inboxEnabled = true
+        await abSaveConfig(cfg)
+        return await m.send(`🛡️ *Anti-Bug Protection Enabled* for your inbox.\n_Malformed/crash-inducing messages sent to you will be auto-deleted._`)
+      }
+      if (t === "off") {
+        cfg.inboxEnabled = false
+        await abSaveConfig(cfg)
+        return await m.send(`🛡️ Anti-Bug Protection disabled for your inbox.`)
+      }
+      return await m.send(
+        `🛡️ *Anti-Bug Protection (Inbox)*\n\n` +
+        `Status: ${cfg.inboxEnabled ? "✅ Active" : "❌ Inactive"}\n\n` +
+        `_${pre}antibug on/off — toggle protection for your DMs_\n\n` +
+        `_Note: if e work, ur money na tukay`
+      )
+    }
+  } catch (e) {
+    console.log("antibug error", e)
+    return await m.sendErr(e)
+  }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  FOLLOW-UP LISTENER — catches replies to Zyrex prompts (no trigger needed)
-// ─────────────────────────────────────────────────────────────────────────────
-kord({ on: "text", fromMe: false }, async (m, rawText) => {
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ❷ CORE LISTENER — runs on every incoming message
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+kord({ on: "all" }, async (m) => {
   try {
-    if (!rawText) return
+    if (m.fromMe) return
+    if (!m.message) return
 
-    const trimmed = rawText.trim()
-    const chatId = m.chat
-    const senderId = m.sender
+    const cfg = await abGetConfig()
+    const isGroupProtected = m.isGroup && cfg.groups.includes(m.chat)
+    const isInboxProtected = !m.isGroup && cfg.inboxEnabled
+    if (!isGroupProtected && !isInboxProtected) return
 
-    // ── Check if this is a follow-up reply ──
-    const pending = getPending(chatId, senderId)
-    if (pending) {
-      // If the user is replying (quoted message is the bot's) OR
-      // their message looks like a time/short answer (not a new Zyrex command)
-      const isZyrexTrigger = /^[Zz][Yy][Rr][Ee][Xx][\s,]/i.test(trimmed)
-      if (!isZyrexTrigger) {
-        clearPending(chatId, senderId)
-        const intent = pending.intent
-        const params = pending.params
+    let result = detectBug(m)
+    if (!result.bugged && m.message.reactionMessage) {
+      result = detectReactionAbuse(m)
+    }
+    if (!result.bugged) return
 
-        // Fill in the missing piece from their reply
-        if (intent === 'lock_followup') {
-          const ms = parseNL_time(trimmed)
-          if (!ms) return await m.send(`${Z} _I need a duration. Example: "10 minutes" or "an hour"._`)
-          if (!(await isBotAdmin(m))) return await m.send(`${Z} _I need admin privileges for that._`)
-          return await zLockGroup(m, ms, null)
+    const key = `${m.chat}_${m.sender}`
+    const offenseCount = trackOffender(key)
+
+    // ── Delete the message if we can ──
+    let deleted = false
+    try {
+      if (m.isGroup) {
+        const botAdmin = await isBotAdmin(m)
+        if (botAdmin) {
+          await m.client.sendMessage(m.chat, { delete: m.key })
+          deleted = true
         }
-        if (intent === 'unlock_followup') {
-          const ms = parseNL_time(trimmed)
-          if (!ms) return await m.send(`${Z} _I need a duration. Example: "5 minutes"._`)
-          if (!(await isBotAdmin(m))) return await m.send(`${Z} _I need admin privileges for that._`)
-          return await zUnlockGroup(m, ms, null)
-        }
-        if (intent === 'group_name_followup') {
-          const name = trimmed
-          if (!name) return
-          if (!(await isBotAdmin(m))) return await m.send(`${Z} _I need admin privileges for that._`)
-          await m.client.groupUpdateSubject(m.chat, name)
-          return await m.send(`${Z} _The group is now known as: *${name}*_`)
-        }
-        if (intent === 'group_desc_followup') {
-          const desc = trimmed
-          if (!desc) return
-          if (!(await isBotAdmin(m))) return await m.send(`${Z} _I need admin privileges for that._`)
-          await m.client.groupUpdateDescription(m.chat, desc)
-          return await m.send(`${Z} _Description updated._`)
-        }
-        return
+      } else {
+        // In private chat we can only delete messages we sent ourselves (fromMe).
+        // We cannot remotely delete a message someone else sent us.
+        deleted = false
       }
+    } catch (_) {}
+
+    const senderTag = m.sender.split("@")[0]
+
+    // ── Low severity = quiet handling ──
+    // These cover edge cases that occasionally fire on legitimate content
+    // (long documents, big polls, odd location data, reaction spam). We still
+    // protect the chat (delete if possible) but skip the public callout to
+    // avoid disrupting normal conversation over a borderline case.
+    if (result.severity === "low") {
+      console.log(`[antibug] quiet-flag: ${result.reason} | sender: ${senderTag} | deleted: ${deleted}`)
+      return
     }
 
-    // ── Main Zyrex trigger ──
-    const triggerMatch = trimmed.match(/^[Zz][Yy][Rr][Ee][Xx]\s*[,]?\s*([\s\S]*)$/)
-    if (!triggerMatch) return
+    // ── High severity = full notice ──
+    const notice =
+      `🛡️ *Anti-Bug Triggered*\n\n` +
+      `Sender:   @${senderTag}\n` +
+      `Reason:   ${result.reason}\n` +
+      `Action:   ${deleted ? "Message deleted ✅" : "Could not delete (bot not admin or private chat) ⚠️"}\n` +
+      `Offense#: ${offenseCount} (in this window)`
 
-    const input = triggerMatch[1].trim()
+    await m.client.sendMessage(m.chat, { text: notice, mentions: [m.sender] })
 
-    if (!input) return await m.send(zrand(greetings))
-
-    const intentData = detectIntent(input)
-    if (!intentData) return await m.send(zrand(unknownR))
-
-    const { intent, params = {} } = intentData
-
-    const adminOnlyIntents = [
-      'lock_now','lock_for','lock_later','unlock_now','unlock_for','unlock_later',
-      'group_link','revoke_link','group_name','group_desc','set_group_pic','remove_group_pic',
-      'add','kick','promote','demote','tag_all','tag_admins',
-      'antilink_on','antilink_off','antiword_on','antiword_off',
-      'warn_user','remove_warn','shadowban','unshadowban','silence','unsilence',
-      'multi_sticker','stop_multi_sticker'
-    ]
-
-    const senderIsAdmin = await isAdmin(m)
-    if (adminOnlyIntents.includes(intent) && !senderIsAdmin) return await m.send(zrand(denials))
-
-    const botIsAdmin = await isBotAdmin(m)
-
-    switch (intent) {
-
-      // ── CONVERSATION ──
-      case 'greet': return await m.send(zrand(greetings))
-      case 'how_are_you': return await m.send(zrand(howAreYouR))
-      case 'how_is_today': return await m.send(zrand(howIsTodayR))
-      case 'who_are_you': return await m.send(
-        `${Z} *${ZNAME}*\n\n_Guardian of this group. Part moderator, part companion, part enigma._\n` +
-        `_I understand natural language, enforce the rules, run the games, and keep things interesting._\n\n` +
-        `_Just say my name. I'll handle the rest._`
-      )
-      case 'time_greeting': {
-        const h = new Date().getHours()
-        const map = { morning: `${Z} Good morning. The day is young — use it well.`, afternoon: `${Z} Good afternoon. Still time to make something of the day.`, evening: `${Z} Good evening. The quiet hours approach.`, night: `${Z} Good night. Rest well — the group will still be here tomorrow.` }
-        const k = h < 12 ? 'morning' : h < 17 ? 'afternoon' : h < 21 ? 'evening' : 'night'
-        return await m.send(map[k])
-      }
-      case 'thanks': return await m.send(zrand([`${Z} Always.`, `${Z} That's what I'm here for.`, `${Z} No need for thanks. Just keep the group alive.`, `${Z} Acknowledged.`]))
-
-      case 'capabilities': return await m.send(
-        `*${ZNAME}*\n\n` +
-        `*🔒 Group Control*\n` +
-        `_Lock/unlock/mute/unmute — instantly, for a duration, or scheduled_\n` +
-        `_"Zyrex lock the group for 30 minutes"_\n` +
-        `_"Zyrex unlock the group in an hour"_\n\n` +
-        `*👥 Members*\n` +
-        `_Add, kick, promote, demote, tag all, tag admins_\n\n` +
-        `*🛡 Moderation*\n` +
-        `_Antilink, antiword, warn, shadowban, silence_\n\n` +
-        `*🃏 Games*\n` +
-        `_Word construction, unscramble, hangman, rhyme it,_\n` +
-        `_would you rather, finish the lyrics, who said that_\n\n` +
-        `*🎭 Media*\n` +
-        `_Make sticker, view once, view once + delete original_\n\n` +
-        `*🎲 Fun*\n` +
-        `_Jokes, facts, roasts, motivation, random member,_\n` +
-        `_coin flip, dice roll_\n\n` +
-        `*⚙️ Utility*\n` +
-        `_Uptime, bot status, group info, group dp, my profile, calculator_\n\n` +
-        `_Talk to me naturally — no prefix, no exact commands._\n` +
-        `_"Zyrex give me the group link", "Zyrex kick @user", "Zyrex tell me a joke"_`
-      )
-
-      // ── LOCK / UNLOCK ──
-      case 'lock_now': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        const meta = await m.client.groupMetadata(m.chat)
-        if (meta.announce) return await m.send(`${Z} _The group is already locked._`)
-        // Ask follow-up: how long?
-        setPending(m.chat, m.sender, 'lock_followup')
-        return await m.send(`${Z} _Locking now or for a duration? Reply with a time like "30 minutes" or "now" to lock immediately._`)
-      }
-      case 'lock_for': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        if (!params.ms) {
-          setPending(m.chat, m.sender, 'lock_followup')
-          return await m.send(`${Z} _For how long? Reply with a duration, e.g. "30 minutes"._`)
-        }
-        const meta = await m.client.groupMetadata(m.chat)
-        if (meta.announce) return await m.send(`${Z} _The group is already locked._`)
-        return await zLockGroup(m, params.ms, null)
-      }
-      case 'lock_later': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        if (!params.ms) {
-          setPending(m.chat, m.sender, 'lock_followup')
-          return await m.send(`${Z} _When should I lock it? Reply with a duration, e.g. "in 10 minutes"._`)
-        }
-        return await zLockGroup(m, null, params.ms)
-      }
-
-      case 'unlock_now': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        const meta = await m.client.groupMetadata(m.chat)
-        if (!meta.announce) return await m.send(`${Z} _The group isn't locked. Nothing to lift._`)
-        setPending(m.chat, m.sender, 'unlock_followup')
-        return await m.send(`${Z} _Unlocking now or for a duration? Reply with a time like "10 minutes" or "now" to open immediately._`)
-      }
-      case 'unlock_for': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        if (!params.ms) {
-          setPending(m.chat, m.sender, 'unlock_followup')
-          return await m.send(`${Z} _For how long? Reply with a duration._`)
-        }
-        const meta = await m.client.groupMetadata(m.chat)
-        if (!meta.announce) return await m.send(`${Z} _The group is already open._`)
-        return await zUnlockGroup(m, params.ms, null)
-      }
-      case 'unlock_later': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        if (!params.ms) {
-          setPending(m.chat, m.sender, 'unlock_followup')
-          return await m.send(`${Z} _When? Reply with a duration, e.g. "in 30 minutes"._`)
-        }
-        return await zUnlockGroup(m, null, params.ms)
-      }
-
-      // ── GROUP LINK ──
-      case 'group_link': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges to fetch the group link._`)
-        const code = await m.client.groupInviteCode(m.chat)
-        return await m.send(`${Z} _Here's the group link:_\nhttps://chat.whatsapp.com/${code}`)
-      }
-      case 'revoke_link': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        await m.client.groupRevokeInvite(m.chat)
-        const newCode = await m.client.groupInviteCode(m.chat)
-        return await m.send(`${Z} _The old link has been destroyed. New link:_\nhttps://chat.whatsapp.com/${newCode}`)
-      }
-
-      // ── GROUP NAME / DESC ──
-      case 'group_name': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        if (!params.name) {
-          setPending(m.chat, m.sender, 'group_name_followup')
-          return await m.send(`${Z} _What should the new name be? Just reply with it._`)
-        }
-        await m.client.groupUpdateSubject(m.chat, params.name)
-        return await m.send(`${Z} _The group is now known as: *${params.name}*_`)
-      }
-      case 'group_desc': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        if (!params.desc) {
-          setPending(m.chat, m.sender, 'group_desc_followup')
-          return await m.send(`${Z} _What should the new description say? Just reply with it._`)
-        }
-        await m.client.groupUpdateDescription(m.chat, params.desc)
-        return await m.send(`${Z} _Description updated. The group now tells its own story._`)
-      }
-
-      // ── GROUP PIC ──
-      case 'get_group_dp': {
-        let ppUrl
-        try { ppUrl = await m.client.profilePictureUrl(m.chat, 'image') } catch { ppUrl = null }
-        if (!ppUrl) return await m.send(`${Z} _This group doesn't have a display picture set._`)
-        return await m.send(ppUrl, { caption: `${Z} _Group display picture._` }, 'image')
-      }
-      case 'set_group_pic': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        const src = m.quoted?.image ? m.quoted : m.image ? m : null
-        if (!src) return await m.send(`${Z} _Reply to or send an image first, then tell me to set it as the group picture._`)
-        const media = await m.client.downloadMediaMessage(src)
-        await m.client.updateProfilePicture(m.chat, media)
-        return await m.send(`${Z} _The group now wears a new face._`)
-      }
-      case 'remove_group_pic': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        await m.client.removeProfilePicture(m.chat)
-        return await m.send(`${Z} _The group picture has been removed. Clean slate._`)
-      }
-
-      // ── GROUP INFO (full: name, desc, dp, invite link, members) ──
-      case 'group_info': {
-        const meta = await m.client.groupMetadata(m.chat)
-        const memberCount = meta.participants.length
-        const adminCount = meta.participants.filter(p => p.admin).length
-        const created = new Date(meta.creation * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
-        let inviteLink = ''
+    // ── Auto-kick repeat offenders (groups only) ──
+    if (m.isGroup && cfg.autoKick && offenseCount >= AB.SPAM_COUNT_TRIGGER) {
+      const botAdmin = await isBotAdmin(m)
+      if (botAdmin) {
         try {
-          if (botIsAdmin) {
-            const code = await m.client.groupInviteCode(m.chat)
-            inviteLink = `\n*Invite Link:* https://chat.whatsapp.com/${code}`
-          }
+          await m.client.groupParticipantsUpdate(m.chat, [m.sender], "remove")
+          await m.client.sendMessage(m.chat, {
+            text: `🛡️ @${senderTag} has been removed for repeatedly sending crash/bug payloads.`,
+            mentions: [m.sender]
+          })
+          abOffenders.delete(key)
         } catch (_) {}
-        let ppUrl
-        try { ppUrl = await m.client.profilePictureUrl(m.chat, 'image') } catch { ppUrl = null }
-        const infoText =
-          `*${Z} Group Intelligence Report*\n\n` +
-          `*Name:* ${meta.subject}\n` +
-          `*Members:* ${memberCount}\n` +
-          `*Admins:* ${adminCount}\n` +
-          `*Created:* ${created}\n` +
-          `*Settings:* ${meta.restrict ? 'Admin-only edits' : 'Open'}\n` +
-          `*Status:* ${meta.announce ? '🔒 Locked' : '🔓 Open'}` +
-          (meta.desc ? `\n*Description:* ${meta.desc}` : '') +
-          inviteLink
-        if (ppUrl) return await m.send(ppUrl, { caption: infoText }, 'image')
-        return await m.send(infoText)
       }
-
-      // ── MEMBER MANAGEMENT ──
-      case 'add': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges to add members._`)
-        const cleanJid = params.number + '@s.whatsapp.net'
-        const check = await m.client.onWhatsApp(cleanJid)
-        if (!check.length) return await m.send(`${Z} _That number isn't on WhatsApp._`)
-        const result = await m.client.groupParticipantsUpdate(m.chat, [cleanJid], 'add')
-        const status = result[0]?.status
-        if (status === '200') return await m.send(`${Z} _@${params.number} has been brought in._`, { mentions: [cleanJid] })
-        if (status === '403') return await m.send(`${Z} _They need to accept an invite. They'll receive one shortly._`)
-        return await m.send(`${Z} _Add result: ${status}._`)
-      }
-      case 'kick': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Who should I remove? Mention or reply to them._`)
-        const jid = parsedJid(user)
-        await m.client.groupParticipantsUpdate(m.chat, [jid], 'remove')
-        return await m.send(`${Z} _@${jid.split('@')[0]} has been removed. Their chapter here is closed._`, { mentions: [jid] })
-      }
-      case 'promote': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Who should I promote? Mention or reply to them._`)
-        if (await isadminn(m, user)) return await m.send(`${Z} _They're already an admin._`)
-        const jid = parsedJid(user)
-        await m.client.groupParticipantsUpdate(m.chat, [jid], 'promote')
-        return await m.send(`${Z} _@${jid.split('@')[0]} has been elevated. Wield the authority wisely._`, { mentions: [jid] })
-      }
-      case 'demote': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Who should I demote? Mention or reply to them._`)
-        if (!await isadminn(m, user)) return await m.send(`${Z} _That person isn't an admin._`)
-        const jid = parsedJid(user)
-        await m.client.groupParticipantsUpdate(m.chat, [jid], 'demote')
-        return await m.send(`${Z} _@${jid.split('@')[0]} has been stripped of their rank._`, { mentions: [jid] })
-      }
-      case 'tag_all': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges to tag everyone._`)
-        const { participants } = await m.client.groupMetadata(m.chat)
-        let msg = `${Z} _Attention, everyone:_\n\n`
-        participants.forEach((p, i) => { msg += `${i + 1}. @${(p.jid || p.phoneNumber).split('@')[0]}\n` })
-        return await m.send(msg, { mentions: participants.map(p => p.jid || p.phoneNumber) })
-      }
-      case 'tag_admins': {
-        const { participants } = await m.client.groupMetadata(m.chat)
-        const admins = participants.filter(p => p.admin).map(p => p.jid || p.phoneNumber)
-        if (!admins.length) return await m.send(`${Z} _There are no admins to summon here._`)
-        let msg = `${Z} _Summoning the admins:_\n\n`
-        admins.forEach((a, i) => { msg += `${i + 1}. @${a.split('@')[0]}\n` })
-        return await m.send(msg, { mentions: admins })
-      }
-      case 'mention_me':
-        return await m.send(`${Z} _Right here — @${m.sender.split('@')[0]}._`, { mentions: [m.sender] })
-
-      // ── MODERATION ──
-      case 'antilink_on': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges to enforce that._`)
-        let data = await getData('antilink') || {}
-        data[m.chat] = data[m.chat] || { active: false, action: 'delete', warnc: 3, permitted: [] }
-        data[m.chat].active = true
-        await storeData('antilink', data)
-        return await m.send(`${Z} _Antilink is armed. Links will be handled._`)
-      }
-      case 'antilink_off': {
-        let data = await getData('antilink') || {}
-        if (!data[m.chat]?.active) return await m.send(`${Z} _Antilink wasn't active._`)
-        data[m.chat].active = false
-        await storeData('antilink', data)
-        return await m.send(`${Z} _Antilink disarmed._`)
-      }
-      case 'antiword_on': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        let aw = await getData('antiword') || {}
-        aw[m.chat] = aw[m.chat] || { active: false, action: 'delete', warnc: 3, words: [] }
-        aw[m.chat].active = true
-        await storeData('antiword', aw)
-        return await m.send(`${Z} _Antiword is now active. Prohibited words will be handled._`)
-      }
-      case 'antiword_off': {
-        let aw = await getData('antiword') || {}
-        if (!aw[m.chat]?.active) return await m.send(`${Z} _Antiword wasn't active._`)
-        aw[m.chat].active = false
-        await storeData('antiword', aw)
-        return await m.send(`${Z} _Antiword deactivated._`)
-      }
-      case 'warn_user': {
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Who should I warn? Mention or reply to them._`)
-        const reason = input.replace(/warn\s+@?\S+\s*/i, '').trim() || 'conduct unbecoming'
-        await warn.addWarn(m.chat, user, reason, m.sender)
-        const wc = await warn.getWcount(m.chat, user)
-        if (wc < config().WARNCOUNT) {
-          return await m.send(`${Z} _@${user.split('@')[0]} has been warned.\nReason: ${reason}\nCount: ${wc}/${config().WARNCOUNT}_`, { mentions: [user] })
-        } else {
-          await warn.resetWarn(m.chat, user)
-          await m.client.groupParticipantsUpdate(m.chat, [user], 'remove')
-          return await m.send(`${Z} _@${user.split('@')[0]} exceeded their warnings. Removed._`, { mentions: [user] })
-        }
-      }
-      case 'remove_warn': {
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Whose warnings should I clear? Mention or reply to them._`)
-        await warn.resetWarn(m.chat, user)
-        return await m.send(`${Z} _@${user.split('@')[0]}'s warnings have been cleared. A fresh start._`, { mentions: [user] })
-      }
-      case 'shadowban': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Who should be shadowbanned? Mention or reply to them._`)
-        let sb = await getShadowbanned()
-        if (!sb[m.chat]) sb[m.chat] = []
-        if (sb[m.chat].includes(user)) return await m.send(`${Z} _That user is already in the shadow._`)
-        sb[m.chat].push(user)
-        await storeData('zyrex_shadowban', sb)
-        return await m.send(`${Z} _@${user.split('@')[0]} now exists in silence. Their messages vanish._`, { mentions: [user] })
-      }
-      case 'unshadowban': {
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Who should I free? Mention or reply._`)
-        let sb = await getShadowbanned()
-        if (!sb[m.chat]?.includes(user)) return await m.send(`${Z} _That user isn't shadowbanned._`)
-        sb[m.chat] = sb[m.chat].filter(u => u !== user)
-        await storeData('zyrex_shadowban', sb)
-        return await m.send(`${Z} _@${user.split('@')[0]} has stepped out of the shadow._`, { mentions: [user] })
-      }
-      case 'silence': {
-        if (!botIsAdmin) return await m.send(`${Z} _I need admin privileges for that._`)
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Who should I silence? Mention or reply to them._`)
-        let sl = await getSilenced()
-        if (!sl[m.chat]) sl[m.chat] = []
-        if (sl[m.chat].includes(user)) return await m.send(`${Z} _That user is already silenced._`)
-        sl[m.chat].push(user)
-        await storeData('zyrex_silence', sl)
-        const notified = (await getData('zyrex_silence_notified')) || {}
-        delete notified[`${m.chat}_${user}`]
-        await storeData('zyrex_silence_notified', notified)
-        return await m.send(`${Z} _@${user.split('@')[0]} has been silenced. Their voice doesn't carry here anymore._`, { mentions: [user] })
-      }
-      case 'unsilence': {
-        const user = m.mentionedJid[0] || m.quoted?.sender
-        if (!user) return await m.send(`${Z} _Who should I unsilence? Mention or reply._`)
-        let sl = await getSilenced()
-        if (!sl[m.chat]?.includes(user)) return await m.send(`${Z} _That user isn't silenced._`)
-        sl[m.chat] = sl[m.chat].filter(u => u !== user)
-        await storeData('zyrex_silence', sl)
-        return await m.send(`${Z} _@${user.split('@')[0]}'s voice has been restored._`, { mentions: [user] })
-      }
-
-      // ── STICKER / MEDIA ──
-      case 'make_sticker': {
-        const msg = await zMakeSticker(m)
-        if (msg) return await m.send(msg)
-        return
-      }
-      case 'view_once': {
-        const msg = await zViewOnce(m, false)
-        if (msg) return await m.send(msg)
-        return await m.send(`${Z} _Sent as view once._`)
-      }
-      case 'view_once_delete': {
-        const msg = await zViewOnce(m, true)
-        if (msg) return await m.send(msg)
-        return await m.send(`${Z} _Sent as view once. Original deleted._`)
-      }
-      case 'multi_sticker': {
-        const duration = params.ms ? fmtDuration(params.ms) : null
-        if (duration) return await m.send(`${Z} _Multi-sticker mode on for ${duration}. Every image becomes a sticker._\n_Use ${prefix}msticker ${params.ms ? Math.floor(params.ms / 1000) + 's' : ''} to enable._`)
-        return await m.send(`${Z} _Multi-sticker mode on. Use ${prefix}msticker to enable._`)
-      }
-      case 'stop_multi_sticker':
-        return await m.send(`${Z} _Multi-sticker mode off. Use ${prefix}stopmsticker to stop._`)
-
-      // ── GAMES ──
-      case 'start_wcg': return await m.send(`${Z} _Word Construction Game starting...\nUse ${prefix}wcg to begin._`)
-      case 'stop_wcg': return await m.send(`${Z} _Ending the Word Construction Game...\nUse ${prefix}delwcg to end._`)
-      case 'unscramble_easy': return await m.send(`${Z} _Let's test your vocabulary. Easy mode.\nUse ${prefix}unscramble easy to begin._`)
-      case 'unscramble_hard': return await m.send(`${Z} _Hard mode. Think carefully.\nUse ${prefix}unscramble hard to begin._`)
-      case 'stop_unscramble': return await m.send(`${Z} _Game over.\nUse ${prefix}stopunscramble to end._`)
-      case 'hangman': return await m.send(`${Z} _The hangman awaits. One wrong letter and it all goes wrong.\nUse ${prefix}hangman to begin._`)
-      case 'rhyme': {
-        const words = ['fire', 'night', 'soul', 'rain', 'gold', 'light', 'dream', 'blade', 'heart', 'storm', 'moon', 'time', 'rise', 'fall', 'dark']
-        return await m.send(`${Z} *Rhyme It!*\n\n_Can you rhyme with:_ *${zrand(words).toUpperCase()}*\n\n_First one to rhyme wins._`)
-      }
-      case 'wyr': {
-        const wyr = [
-          `Would you rather have the ability to fly, but only as fast as a bicycle — or be invisible, but only when no one is looking for you?`,
-          `Would you rather know how every movie ends before watching it — or never be able to rewatch a movie?`,
-          `Would you rather lose all your memories from the past 5 years — or never be able to make new ones?`,
-          `Would you rather always speak in rhymes — or only communicate through song?`,
-          `Would you rather have a job you hate that pays extremely well — or a job you love that barely pays?`,
-          `Would you rather always know when someone is lying — or always get away with lying yourself?`,
-          `Would you rather be famous but alone — or unknown but deeply loved?`
-        ]
-        return await m.send(`${Z} *Would You Rather?*\n\n_${zrand(wyr)}_\n\n_Vote A or B._`)
-      }
-      case 'finish_lyrics': {
-        const lyrics = [
-          { line: "🎵 _Is this the real life?_", song: "Bohemian Rhapsody – Queen" },
-          { line: "🎵 _Started from the bottom now we're..._", song: "Started From The Bottom – Drake" },
-          { line: "🎵 _We will, we will..._", song: "We Will Rock You – Queen" },
-          { line: "🎵 _I used to rule the world..._", song: "Viva La Vida – Coldplay" },
-          { line: "🎵 _Hello, it's me..._", song: "Hello – Adele" },
-          { line: "🎵 _Don't stop believin'..._", song: "Don't Stop Believin' – Journey" },
-        ]
-        const pick = zrand(lyrics)
-        return await m.send(`${Z} *Finish The Lyrics!*\n\n${pick.line}\n\n_First one to complete it wins._\n_(${pick.song})_`)
-      }
-      case 'who_said_that': {
-        const quotes = [
-          { q: `"Be the change you wish to see in the world."`, a: "Mahatma Gandhi" },
-          { q: `"In the middle of difficulty lies opportunity."`, a: "Albert Einstein" },
-          { q: `"The only way to do great work is to love what you do."`, a: "Steve Jobs" },
-          { q: `"Not all those who wander are lost."`, a: "J.R.R. Tolkien" },
-          { q: `"With great power comes great responsibility."`, a: "Uncle Ben / Stan Lee" },
-          { q: `"Life is what happens when you're busy making other plans."`, a: "John Lennon" }
-        ]
-        const p = zrand(quotes)
-        return await m.send(`${Z} *Who Said That?*\n\n${p.q}\n\n_Who said this? First correct answer wins._`)
-      }
-
-      // ── UTILITY ──
-      case 'calculate': {
-        try {
-          const expr = (params.expr || '').replace(/×/g, '*').replace(/÷/g, '/').replace(/\^/g, '**')
-          // Safe: only allow digits and math operators
-          if (!/^[\d\s+\-*/.()%**]+$/.test(expr)) return await m.send(`${Z} _That expression doesn't look right. Try: Zyrex calculate 25 × 4_`)
-          // eslint-disable-next-line no-new-func
-          const result = Function(`"use strict"; return (${expr})`)()
-          if (!isFinite(result)) return await m.send(`${Z} _That expression doesn't resolve._`)
-          return await m.send(`${Z} _${params.expr} = *${result}*_`)
-        } catch { return await m.send(`${Z} _Could not calculate that. Try a simpler expression._`) }
-      }
-      case 'uptime': {
-        return await m.send(`${Z} _I have been running for: *${fmtDuration(process.uptime() * 1000)}*_`)
-      }
-      case 'bot_status': {
-        const up = fmtDuration(process.uptime() * 1000)
-        const memMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1)
-        return await m.send(`*${Z} System Status*\n\n*Uptime:* ${up}\n*Memory:* ${memMB} MB\n*Node:* ${process.version}\n*Status:* Operational ✓`)
-      }
-      case 'my_profile': {
-        let ppUrl; try { ppUrl = await m.client.profilePictureUrl(m.sender, 'image') } catch { ppUrl = null }
-        const name = m.pushName || m.sender.split('@')[0]
-        const isAdm = await isAdmin(m)
-        const txt = `*${Z} Your Profile*\n\n*Name:* ${name}\n*Number:* ${m.sender.split('@')[0]}\n*Role:* ${isAdm ? 'Admin ✓' : 'Member'}\n*Chat:* ${m.isGroup ? 'Group' : 'Private'}`
-        if (ppUrl) return await m.send(ppUrl, { caption: txt }, 'image')
-        return await m.send(txt)
-      }
-
-      // ── FUN ──
-      case 'joke': return await m.send(zrand(jokeBank))
-      case 'fact': return await m.send(zrand(factBank))
-      case 'roast': return await m.send(zrand(roastBank))
-      case 'motivate': return await m.send(zrand(motivationBank))
-      case 'random_member': {
-        const { participants } = await m.client.groupMetadata(m.chat)
-        if (participants.length < 2) return await m.send(`${Z} _Not enough members to pick from._`)
-        const others = participants.filter(p => (p.jid || p.phoneNumber) !== m.sender)
-        const picked = zrand(others)
-        const jid = picked.jid || picked.phoneNumber
-        return await m.send(`${Z} _The fates have decided..._\n\n*@${jid.split('@')[0]}*`, { mentions: [jid] })
-      }
-      case 'coin_flip':
-        return await m.send(`${Z} _The coin turns..._\n\n*${Math.random() < 0.5 ? 'Heads 🪙' : 'Tails 🪙'}*`)
-      case 'roll_dice': {
-        const roll = Math.floor(Math.random() * 6) + 1
-        return await m.send(`${Z} _The dice falls..._\n\n*${['⚀','⚁','⚂','⚃','⚄','⚅'][roll - 1]} ${roll}*`)
-      }
-
-      default: return await m.send(zrand(unknownR))
     }
 
   } catch (e) {
-    console.log('zyrex error', e)
-    try { await m.send(`${Z} _Something went wrong on my end. Try again._`) } catch (_) {}
+    // Never let antibug itself crash the bot
+    console.log("antibug listener error", e)
   }
 })
+
+
+
+
+
+
