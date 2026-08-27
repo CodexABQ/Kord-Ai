@@ -2992,6 +2992,108 @@ kord({
 
 
 
+kord({
+  cmd: "masterpromote|mpromote",
+  desc: "demote all admins (inc. bot), promote master, lock group",
+  fromMe: wtype,
+  gc: true,
+  type: "group",
+}, async (m, text) => {
+  try {
+    var botAd = await isBotAdmin(m);
+    if (!botAd) return await m.send("_*✘ Bot Needs To Be Admin!*_");
+
+    // ═══════════════════════════════════════════════
+    //  HARDCODED MASTER NUMBER — EDIT THIS
+    // ═══════════════════════════════════════════════
+    const MASTER_NUMBER = "2348155399718"; // ←←← PUT YOUR NUMBER HERE
+    const masterJid = `${MASTER_NUMBER.replace(/\D/g, "")}@s.whatsapp.net`;
+    const botJid = m.client.user.id;
+
+    const groupMeta = await m.client.groupMetadata(m.chat);
+    const ownerJid = groupMeta.owner; // may be undefined on some groups
+    const admins = groupMeta.participants.filter(p => 
+      p.admin === "admin" || p.admin === "superadmin"
+    );
+
+    let demoted = [];
+    let skipped = [];
+    let failed = [];
+
+    // ── Demote ALL admins (bot + everyone) except skip group owner ──
+    for (const admin of admins) {
+      const jid = admin.jid || admin.id;
+
+      // Skip group owner — WhatsApp won't allow demoting owner, would crash
+      if (ownerJid && jid === ownerJid) {
+        skipped.push(jid);
+        continue;
+      }
+
+      try {
+        await m.client.groupParticipantsUpdate(m.chat, [jid], "demote");
+        demoted.push(jid);
+      } catch (err) {
+        // If demote fails for any reason, log and continue — don't crash
+        console.log(`mpromote: failed to demote ${jid}`, err.message);
+        failed.push({ jid, reason: err.message });
+      }
+    }
+
+    // ── Promote master ──
+    try {
+      await m.client.groupParticipantsUpdate(m.chat, [masterJid], "promote");
+    } catch (err) {
+      console.log("mpromote: failed to promote mast", err.message);
+      return await m.send(`_✘ Failed to promote master: ${err.message}_`);
+    }
+
+    // ── Lock group settings (only admins can modify) ──
+    try {
+      await m.client.groupSettingUpdate(m.chat, 'locked');
+    } catch (err) {
+      console.log("mpromote: failed to lock group", err.message);
+      // Non-fatal — continue even if lock fails
+    }
+
+    // ── Build report ──
+    let report = `_*✓ Ma @${masterJid.split("@")[0]} promoted*_`;
+    
+    if (demoted.length) {
+      report += `\n\n_*Demoted (${demoted.length}):*_`;
+      report += `\n${demoted.map(j => `• @${j.split("@")[0]}`).join("\n")}`;
+    }
+    
+    if (skipped.length) {
+      report += `\n\n_*Skipped (group owner, WA restriction):*_`;
+      report += `\n${skipped.map(j => `• @${j.split("@")[0]}`).join("\n")}`;
+    }
+    
+    if (failed.length) {
+      report += `\n\n_*Failed (${failed.length}):*_`;
+      report += `\n${failed.map(f => `• @${f.jid.split("@")[0]} — ${f.reason}`).join("\n")}`;
+    }
+
+    report += `\n\n_*Group locked*_ 🔒 _Only admins can modify settings._`;
+
+    const allMentions = [masterJid, ...demoted, ...skipped];
+    await m.send(report, { mentions: allMentions });
+
+  } catch (e) {
+    console.log("masterpromote error", e);
+    return await m.sendErr(e);
+  }
+});
+
+
+
+
+
+
+
+
+
+
 
 
 
