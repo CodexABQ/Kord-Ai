@@ -2989,10 +2989,9 @@ kord({
 
 
 
-
- kord({
+kord({
   cmd: "masterpromote|mpromote",
-  desc: "promote master first, then demote all other admins, lock group",
+  desc: "promote M first, then demote all other admins, lock group",
   fromMe: wtype,
   gc: true,
   type: "group",
@@ -3001,9 +3000,11 @@ kord({
     var botAd = await isBotAdmin(m);
     if (!botAd) return await m.send("_*✘ Bot Needs To Be Admin!*_");
 
-    const MASTER_NUMBER = "2348155399718"; // ←←← YOUR NUMBER
-    const masterJid = `${MASTER_NUMBER.replace(/\D/g, "")}@s.whatsapp.net`;
-    const botJid = m.client.user.id;
+    // ═══════════════════════════════════════════════
+    //  HARDCODED M NUMBER — EDIT THIS
+    // ═══════════════════════════════════════════════
+    const MASTER_NUMBER = "2348155399718";
+    const masterJid = parsedJid(MASTER_NUMBER); // ← uses same helper as promote cmd
 
     const groupMeta = await m.client.groupMetadata(m.chat);
     const ownerJid = groupMeta.owner;
@@ -3011,15 +3012,7 @@ kord({
       p.admin === "admin" || p.admin === "superadmin"
     );
 
-    // ── STEP 1: Promote master FIRST (while bot still has admin power) ──
-    const isMasterMember = groupMeta.participants.some(p => 
-      (p.jid || p.id) === masterJid
-    );
-    
-    if (!isMasterMember) {
-      return await m.send(`_✘ M @${masterJid.split("@")[0]} is not in this group._`, { mentions: [masterJid] });
-    }
-
+    // ── STEP 1: Promote M FIRST (while bot still has admin power) ──
     const isMasterAdmin = admins.some(p => (p.jid || p.id) === masterJid);
     if (!isMasterAdmin) {
       try {
@@ -3040,7 +3033,7 @@ kord({
     for (const admin of admins) {
       const jid = admin.jid || admin.id;
       
-      // Skip master (just promoted) and group owner (WA restriction)
+      // Skip M (just promoted/already admin) and group owner (WA restriction)
       if (jid === masterJid) continue;
       if (ownerJid && jid === ownerJid) {
         skipped.push(jid);
@@ -3074,7 +3067,7 @@ kord({
     if (failed.length) {
       report += `\n\n_*Failed:*_ ${failed.map(f => `@${f.jid.split("@")[0]} — ${f.reason}`).join(", ")}`;
     }
-    report += `\n\n_*Group locked*_ `;
+    report += `\n\n_*Group locked*_ 🔒`;
 
     const allMentions = [...demoted, ...skipped, masterJid];
     await m.send(report, { mentions: allMentions });
