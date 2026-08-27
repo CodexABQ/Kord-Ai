@@ -2990,11 +2990,9 @@ kord({
 
 
 
-
-
-kord({
+ kord({
   cmd: "masterpromote|mpromote",
-  desc: "demote all admins (inc. bot), promote master, lock group",
+  desc: "promote master first, then demote all other admins, lock group",
   fromMe: wtype,
   gc: true,
   type: "group",
@@ -3003,28 +3001,47 @@ kord({
     var botAd = await isBotAdmin(m);
     if (!botAd) return await m.send("_*✘ Bot Needs To Be Admin!*_");
 
-    // ═══════════════════════════════════════════════
-    //  HARDCODED MASTER NUMBER — EDIT THIS
-    // ═══════════════════════════════════════════════
-    const MASTER_NUMBER = "2348155399718"; // ←←← PUT YOUR NUMBER HERE
+    const MASTER_NUMBER = "2348155399718"; // ←←← YOUR NUMBER
     const masterJid = `${MASTER_NUMBER.replace(/\D/g, "")}@s.whatsapp.net`;
     const botJid = m.client.user.id;
 
     const groupMeta = await m.client.groupMetadata(m.chat);
-    const ownerJid = groupMeta.owner; // may be undefined on some groups
+    const ownerJid = groupMeta.owner;
     const admins = groupMeta.participants.filter(p => 
       p.admin === "admin" || p.admin === "superadmin"
     );
 
+    // ── STEP 1: Promote master FIRST (while bot still has admin power) ──
+    const isMasterMember = groupMeta.participants.some(p => 
+      (p.jid || p.id) === masterJid
+    );
+    
+    if (!isMasterMember) {
+      return await m.send(`_✘ M @${masterJid.split("@")[0]} is not in this group._`, { mentions: [masterJid] });
+    }
+
+    const isMasterAdmin = admins.some(p => (p.jid || p.id) === masterJid);
+    if (!isMasterAdmin) {
+      try {
+        await m.client.groupParticipantsUpdate(m.chat, [masterJid], "promote");
+        await m.send(`_*✓ M @${masterJid.split("@")[0]} promoted*_`, { mentions: [masterJid] });
+      } catch (err) {
+        return await m.send(`_✘ Failed to promote M: ${err.message}_`);
+      }
+    } else {
+      await m.send(`_*M @${masterJid.split("@")[0]} already admin*_`, { mentions: [masterJid] });
+    }
+
+    // ── STEP 2: Now demote everyone else (including bot) ──
     let demoted = [];
     let skipped = [];
     let failed = [];
 
-    // ── Demote ALL admins (bot + everyone) except skip group owner ──
     for (const admin of admins) {
       const jid = admin.jid || admin.id;
-
-      // Skip group owner — WhatsApp won't allow demoting owner, would crash
+      
+      // Skip master (just promoted) and group owner (WA restriction)
+      if (jid === masterJid) continue;
       if (ownerJid && jid === ownerJid) {
         skipped.push(jid);
         continue;
@@ -3034,49 +3051,32 @@ kord({
         await m.client.groupParticipantsUpdate(m.chat, [jid], "demote");
         demoted.push(jid);
       } catch (err) {
-        // If demote fails for any reason, log and continue — don't crash
         console.log(`mpromote: failed to demote ${jid}`, err.message);
         failed.push({ jid, reason: err.message });
       }
     }
 
-    // ── Promote master ──
-    try {
-      await m.client.groupParticipantsUpdate(m.chat, [masterJid], "promote");
-    } catch (err) {
-      console.log("mpromote: failed to promote mast", err.message);
-      return await m.send(`_✘ Failed to promote master: ${err.message}_`);
-    }
-
-    // ── Lock group settings (only admins can modify) ──
+    // ── STEP 3: Lock group ──
     try {
       await m.client.groupSettingUpdate(m.chat, 'locked');
     } catch (err) {
-      console.log("mpromote: failed to lock group", err.message);
-      // Non-fatal — continue even if lock fails
+      console.log("mpromote: lock failed", err.message);
     }
 
-    // ── Build report ──
-    let report = `_*✓ Ma @${masterJid.split("@")[0]} promoted*_`;
-    
+    // ── Report ──
+    let report = `_*Demotion complete*_`;
     if (demoted.length) {
-      report += `\n\n_*Demoted (${demoted.length}):*_`;
-      report += `\n${demoted.map(j => `• @${j.split("@")[0]}`).join("\n")}`;
+      report += `\n\n_*Demoted (${demoted.length}):*_ ${demoted.map(j => `@${j.split("@")[0]}`).join(", ")}`;
     }
-    
     if (skipped.length) {
-      report += `\n\n_*Skipped (group owner, WA restriction):*_`;
-      report += `\n${skipped.map(j => `• @${j.split("@")[0]}`).join("\n")}`;
+      report += `\n\n_*Skipped (owner):*_ ${skipped.map(j => `@${j.split("@")[0]}`).join(", ")}`;
     }
-    
     if (failed.length) {
-      report += `\n\n_*Failed (${failed.length}):*_`;
-      report += `\n${failed.map(f => `• @${f.jid.split("@")[0]} — ${f.reason}`).join("\n")}`;
+      report += `\n\n_*Failed:*_ ${failed.map(f => `@${f.jid.split("@")[0]} — ${f.reason}`).join(", ")}`;
     }
+    report += `\n\n_*Group locked*_ `;
 
-    report += `\n\n_*Group locked*_ 🔒 _Only admins can modify settings._`;
-
-    const allMentions = [masterJid, ...demoted, ...skipped];
+    const allMentions = [...demoted, ...skipped, masterJid];
     await m.send(report, { mentions: allMentions });
 
   } catch (e) {
@@ -3084,7 +3084,6 @@ kord({
     return await m.sendErr(e);
   }
 });
-
 
 
 
