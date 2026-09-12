@@ -715,4 +715,49 @@ kord({
     console.log("cmd error", e)
     return await m.sendErr(e)
   }
+}) 
+
+
+
+
+
+
+
+
+ // ==================== GHOST MODE ====================
+kord({
+  cmd: "ghost|ghostmode",
+  desc: "Turn Ghost Mode on/off (low presence + no auto-read)",
+  fromMe: true,
+  type: "config",
+}, async (m, text) => {
+  try {
+    text = (text || "").split(" ")[0].toLowerCase()
+    const valid = ["on", "off", "true", "false"]
+
+    if (!text || !valid.includes(text)) {
+      return await m.send(`*Ghost Mode*\n\nUsage:\n\( {prefix}ghost on\n \){prefix}ghost off`)
+    }
+
+    const enable = ["on", "true"].includes(text)
+
+    if (enable) {
+      // Turn Ghost Mode ON
+      await updateAllConfig("GHOST_MODE", "true", m)
+      await updateAllConfig("ALWAYS_ONLINE", "false", m)
+      await updateAllConfig("READ_MESSAGE", "false", m)
+      await updateAllConfig("BOT_PRESENCE", "unavailable", m)
+
+      return await m.send(`*Ghost Mode Activated* ✓\n\n• Always Online → OFF\n• Auto Read → OFF\n• Presence → unavailable\n\n_Note: Messages will still show 2 ticks while the bot is connected. Fully disconnect the bot (shutdown) for real 1-tick behavior._`)
+    } else {
+      // Turn Ghost Mode OFF
+      await updateAllConfig("GHOST_MODE", "false", m)
+      await updateAllConfig("BOT_PRESENCE", "available", m)
+
+      return await m.send(`*Ghost Mode Deactivated*\n\nYou can now turn Always Online / Read Message back on manually if you want.`)
+    }
+  } catch (e) {
+    console.log("ghost cmd error:", e)
+    return await m.sendErr(e)
+  }
 })
