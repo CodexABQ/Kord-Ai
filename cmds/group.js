@@ -2975,3 +2975,277 @@ kord({
     return await m.sendErr(e)
   }
 })
+
+
+
+
+
+
+ /* 
+ * Group Preset System
+ * Save & apply group protection settings easily
+ */
+
+const { kord, wtype, getData, storeData, isBotAdmin, prefix } = require("../core")
+
+// ========== BUILT-IN PRESETS ==========
+const BUILTIN_PRESETS = {
+  strict: {
+    name: "Strict",
+    description: "Maximum protection - kicks on almost everything",
+    antilink: { active: true, action: "kick", warnc: 0, permitted: [] },
+    antibot: { action: "kick", warnc: "0", maxwrn: "2" },
+    antitag: { action: "kick", warnc: "0", maxwrn: "2", mode: "members" },
+    antigm: { action: "kick", warnc: "0", maxwrn: "2" },
+    antigsw: { action: "kick", warnc: "0", maxwrn: "2" },
+    antispam: { action: "kick", warnc: "0", maxwrn: "2", msgLimit: 4, timeFrame: 8 }
+  },
+  moderate: {
+    name: "Moderate",
+    description: "Balanced protection - deletes first, then warns",
+    antilink: { active: true, action: "delete", warnc: 0, permitted: [] },
+    antibot: { action: "del", warnc: "0", maxwrn: "3" },
+    antitag: { action: "del", warnc: "0", maxwrn: "3", mode: "members" },
+    antigm: { action: "del", warnc: "0", maxwrn: "3" },
+    antigsw: { action: "del", warnc: "0", maxwrn: "3" },
+    antispam: { action: "del", warnc: "0", maxwrn: "3", msgLimit: 6, timeFrame: 10 }
+  },
+  easy: {
+    name: "Easy",
+    description: "Light protection - only deletes links & spam",
+    antilink: { active: true, action: "delete", warnc: 0, permitted: [] },
+    antibot: null,          // disabled
+    antitag: null,
+    antigm: null,
+    antigsw: null,
+    antispam: { action: "del", warnc: "0", maxwrn: "4", msgLimit: 8, timeFrame: 12 }
+  },
+  off: {
+    name: "Off",
+    description: "Disable all protection features",
+    antilink: { active: false, action: null, warnc: 0, permitted: [] },
+    antibot: null,
+    antitag: null,
+    antigm: null,
+    antigsw: null,
+    antispam: null
+  }
+}
+
+// ========== HELPER FUNCTIONS ==========
+async function getCurrentGroupSettings(jid) {
+  const settings = {}
+
+  // antilink (object keyed by jid)
+  const antilinkData = await getData("antilink") || {}
+  settings.antilink = antilinkData[jid] || { active: false, action: null, warnc: 0, permitted: [] }
+
+  // Array-based configs
+  const arrayKeys = {
+    antibot: "antibot_config",
+    antitag: "antitag_config",
+    antigm: "antigm_config",
+    antigsw: "antigsw_config",
+    antispam: "antispam_config"
+  }
+
+  for (const [key, storageKey] of Object.entries(arrayKeys)) {
+    let data = await getData(storageKey)
+    if (!Array.isArray(data)) {
+      try { data = JSON.parse(data) } catch { data = [] }
+    }
+    if (!Array.isArray(data)) data = []
+
+    const found = data.find(e => e.chatJid === jid)
+    settings[key] = found || null
+  }
+
+  return settings
+}
+
+async function applySettingsToGroup(jid, settings) {
+  // === Antilink ===
+  let antilinkData = await getData("antilink") || {}
+  if (settings.antilink) {
+    antilinkData[jid] = settings.antilink
+  } else {
+    delete antilinkData[jid]
+  }
+  await storeData("antilink", antilinkData)
+
+  // === Array-based configs ===
+  const arrayKeys = {
+    antibot: "antibot_config",
+    antitag: "antitag_config",
+    antigm: "antigm_config",
+    antigsw: "antigsw_config",
+    antispam: "antispam_config"
+  }
+
+  for (const [key, storageKey] of Object.entries(arrayKeys)) {
+    let data = await getData(storageKey)
+    if (!Array.isArray(data)) {
+      try { data = JSON.parse(data) } catch { data = [] }
+    }
+    if (!Array.isArray(data)) data = []
+
+    // Remove existing entry for this group
+    data = data.filter(e => e.chatJid !== jid)
+
+    // Add new setting if it exists
+    if (settings[key]) {
+      data.push({
+        chatJid: jid,
+        ...settings[key]
+      })
+    }
+
+    await storeData(storageKey, JSON.stringify(data, null, 2))
+  }
+}
+
+function formatPresetInfo(name, preset) {
+  let msg = `*Preset: ${preset.name || name}*\n`
+  if (preset.description) msg += `_${preset.description}_\n`
+  msg += `\n`
+
+  const features = [
+    ["Antilink", preset.antilink],
+    ["AntiBot", preset.antibot],
+    ["AntiTag", preset.antitag],
+    ["AntiGM", preset.antigm],
+    ["Anti Group Status", preset.antigsw],
+    ["AntiSpam", preset.antispam]
+  ]
+
+  for (const [label, conf] of features) {
+    if (!conf || (conf.active === false)) {
+      msg += `✘ ${label}: Off\n`
+    } else {
+      const action = conf.action || "on"
+      msg += `✓ ${label}: ${action}\n`
+    }
+  }
+  return msg
+}
+
+// ========== COMMANDS ==========
+
+kord({
+  cmd: "preset",
+  desc: "Save, apply and manage group protection presets",
+  fromMe: true,
+  gc: true,
+  type: "group",
+}, async (m, text) => {
+  try {
+    const botAd = await isBotAdmin(m)
+    if (!botAd) return await m.send("_*✘ Bot Needs To Be Admin!*_")
+
+    const args = (text || "").trim().split(/\s+/)
+    const sub = (args[0] || "").toLowerCase()
+    const name = args[1] ? args[1].toLowerCase() : null
+
+    // Load custom presets
+    let customPresets = await getData("group_presets") || {}
+
+    // ========== HELP ==========
+    if (!sub) {
+      return await m.send(`*Group Preset System*
+
+*Usage:*
+${prefix}preset save <name>     - Save current group settings
+${prefix}preset apply <name>    - Apply a preset to this group
+${prefix}preset list            - List all presets
+${prefix}preset info <name>     - Show preset details
+${prefix}preset delete <name>   - Delete a custom preset
+
+*Built-in Presets:*
+• strict     - Maximum protection (kick)
+• moderate   - Balanced (delete + warn)
+• easy       - Light protection
+• off        - Disable everything
+
+_Example:_
+${prefix}preset save mygroup
+${prefix}preset apply strict`)
+    }
+
+    // ========== LIST ==========
+    if (sub === "list") {
+      let msg = `*Available Presets*\n\n*Built-in:*\n`
+      for (const [key, p] of Object.entries(BUILTIN_PRESETS)) {
+        msg += `• ${key} → ${p.description}\n`
+      }
+
+      const customs = Object.keys(customPresets)
+      if (customs.length) {
+        msg += `\n*Custom:*\n`
+        for (const key of customs) {
+          msg += `• ${key}\n`
+        }
+      } else {
+        msg += `\n_No custom presets saved yet_`
+      }
+      return await m.send(msg)
+    }
+
+    // ========== INFO ==========
+    if (sub === "info") {
+      if (!name) return await m.send(`_*Usage:*_ ${prefix}preset info <name>`)
+
+      if (BUILTIN_PRESETS[name]) {
+        return await m.send(formatPresetInfo(name, BUILTIN_PRESETS[name]))
+      }
+      if (customPresets[name]) {
+        return await m.send(formatPresetInfo(name, customPresets[name]))
+      }
+      return await m.send(`✘ Preset *${name}* not found`)
+    }
+
+    // ========== SAVE ==========
+    if (sub === "save") {
+      if (!name) return await m.send(`_*Usage:*_ ${prefix}preset save <name>`)
+      if (BUILTIN_PRESETS[name]) return await m.send(`✘ *${name}* is a built-in preset. Choose another name.`)
+
+      const current = await getCurrentGroupSettings(m.chat)
+      customPresets[name] = {
+        name: name,
+        description: `Custom preset saved from group`,
+        ...current,
+        savedAt: new Date().toISOString()
+      }
+
+      await storeData("group_presets", customPresets)
+      return await m.send(`✓ Preset *\( {name}* saved successfully!\n\nUse \` \){prefix}preset apply ${name}\` in other groups.`)
+    }
+
+    // ========== APPLY ==========
+    if (sub === "apply") {
+      if (!name) return await m.send(`_*Usage:*_ ${prefix}preset apply <name>`)
+
+      let preset = BUILTIN_PRESETS[name] || customPresets[name]
+      if (!preset) return await m.send(`✘ Preset *\( {name}* not found\nUse \` \){prefix}preset list\``)
+
+      await applySettingsToGroup(m.chat, preset)
+      return await m.send(`✓ Preset *\( {preset.name || name}* applied to this group!\n\n \){formatPresetInfo(name, preset)}`)
+    }
+
+    // ========== DELETE ==========
+    if (sub === "delete" || sub === "del") {
+      if (!name) return await m.send(`_*Usage:*_ ${prefix}preset delete <name>`)
+      if (BUILTIN_PRESETS[name]) return await m.send(`✘ Cannot delete built-in preset`)
+      if (!customPresets[name]) return await m.send(`✘ Custom preset *${name}* not found`)
+
+      delete customPresets[name]
+      await storeData("group_presets", customPresets)
+      return await m.send(`✓ Preset *${name}* deleted`)
+    }
+
+    return await m.send(`✘ Unknown subcommand\nUse \`${prefix}preset\` to see help`)
+
+  } catch (e) {
+    console.log("preset error:", e)
+    return await m.sendErr(e)
+  }
+})
