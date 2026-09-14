@@ -789,3 +789,83 @@ try {
 }
 })
 
+
+
+
+
+
+ kord({
+  cmd: "pstk|pinsticker|pinstk",
+  desc: "Convert Pinterest image/video links to stickers (supports multiple)",
+  fromMe: wtype,
+  type: "converter",
+}, async (m, text) => {
+  try {
+    const urls = extractUrlsFromString(text || m.quoted?.text || "")
+      .filter(u => /pinterest\.com|pin\.it/i.test(u))
+
+    if (!urls.length) {
+      return await m.send(`_*Send one or more Pinterest links*_\n\nExample:\n\( {prefix}pstk https://pin.it/xxxxx\n\nOr multiple:\n \){prefix}pstk https://pin.it/1 https://pin.it/2`)
+    }
+
+    // Get pack name & author
+    let stkpack = config().STICKER_PACKNAME
+    let stkauthor = config().STICKER_AUTHOR
+
+    const nameMatch = text.match(/^(.+?)[,;|]\s*(.+?)(?:\s+https?|$)/i)
+    if (nameMatch) {
+      stkpack = nameMatch[1].trim()
+      stkauthor = nameMatch[2].trim()
+    }
+
+    await m.react("⏳")
+
+    let success = 0
+    let failed = 0
+
+    for (const url of urls) {
+      try {
+        // Free Pinterest downloader method
+        const res = await fetch(`https://api.kord.live/pinterest?url=${encodeURIComponent(url)}`)
+        const data = await res.json()
+
+        if (!data?.url && !data?.media) {
+          // Fallback method
+          const fallback = await fetch(`https://pinterestdownloader.com/download?url=${encodeURIComponent(url)}`)
+          // If fallback also fails, skip
+          failed++
+          continue
+        }
+
+        const mediaUrl = data.url || data.media || data.image || data.video
+        const buff = await getBuffer(mediaUrl)
+
+        if (!buff) {
+          failed++
+          continue
+        }
+
+        await m.sendstk(buff, {
+          packname: stkpack,
+          author: stkauthor
+        })
+
+        success++
+        await sleep(800) // small delay so it doesn't spam
+      } catch (err) {
+        console.log("pstk error:", err)
+        failed++
+      }
+    }
+
+    await m.react(success > 0 ? "✓" : "✘")
+
+    if (urls.length > 1) {
+      await m.send(`✓ Done!\nSuccess: ${success}\nFailed: ${failed}`)
+    }
+
+  } catch (e) {
+    console.log("pstk cmd error", e)
+    return await m.sendErr(e)
+  }
+})
