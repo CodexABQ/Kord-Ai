@@ -2978,15 +2978,14 @@ kord({
 
 
 
-
-
-
+ 
+ 
+ 
+ 
  /* 
  * Group Preset System
  * Save & apply group protection settings easily
  */
-
-const { kord, wtype, getData, storeData, isBotAdmin, prefix } = require("../core")
 
 // ========== BUILT-IN PRESETS ==========
 const BUILTIN_PRESETS = {
@@ -3014,7 +3013,7 @@ const BUILTIN_PRESETS = {
     name: "Easy",
     description: "Light protection - only deletes links & spam",
     antilink: { active: true, action: "delete", warnc: 0, permitted: [] },
-    antibot: null,          // disabled
+    antibot: null,
     antitag: null,
     antigm: null,
     antigsw: null,
@@ -3129,8 +3128,7 @@ function formatPresetInfo(name, preset) {
   return msg
 }
 
-// ========== COMMANDS ==========
-
+// ========== COMMAND ==========
 kord({
   cmd: "preset",
   desc: "Save, apply and manage group protection presets",
