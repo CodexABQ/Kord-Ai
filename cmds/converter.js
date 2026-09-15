@@ -793,10 +793,10 @@ try {
 
 
 
-
+ 
  kord({
   cmd: "pstk|pinsticker|pinstk",
-  desc: "Convert Pinterest image/video links to stickers (supports multiple)",
+  desc: "Convert Pinterest pins or board links to stickers",
   fromMe: wtype,
   type: "converter",
 }, async (m, text) => {
@@ -805,7 +805,7 @@ try {
       .filter(u => /pinterest\.com|pin\.it/i.test(u))
 
     if (!urls.length) {
-      return await m.send(`_*Send one or more Pinterest links*_\n\nExample:\n\( {prefix}pstk https://pin.it/xxxxx\n\nMultiple:\n \){prefix}pstk https://pin.it/1 https://pin.it/2`)
+      return await m.send(`_*Send Pinterest pin or board link(s)*_\n\nExamples:\n\( {prefix}pstk https://pin.it/xxxxx\n \){prefix}pstk https://pin.it/boardlink`)
     }
 
     // Pack name & author
@@ -820,61 +820,72 @@ try {
 
     await m.react("⏳")
 
+    let allMediaUrls = []
     let success = 0
     let failed = 0
 
     for (const link of urls) {
       try {
-        // 1. Expand short pin.it links
+        // Expand short links
         let finalUrl = link
         if (link.includes("pin.it")) {
           const res = await fetch(link, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0" } })
           finalUrl = res.url
         }
 
-        // 2. Fetch the Pinterest page
         const page = await fetch(finalUrl, {
           headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
           }
         })
         const html = await page.text()
 
-        // 3. Try to extract high quality image/video
-        let mediaUrl = null
+        // Check if it's a board
+        const isBoard = /\/board\//i.test(finalUrl) || html.includes('"board_id"') || html.includes('BoardResource')
 
-        // Method 1: og:image
-        const ogImage = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
-        if (ogImage) mediaUrl = ogImage[1]
+        if (isBoard) {
+          // Extract multiple images from board
+          const matches = html.match(/https:\/\/i\.pinimg\.com\/[^"'\s]+/g) || []
+          const unique = [...new Set(matches)]
+            .filter(u => u.includes("originals") || u.includes("1200x") || u.includes("736x") || u.includes("564x"))
+            .slice(0, 30) // Safety limit
 
-        // Method 2: Look for originals or high-res in JSON
-        if (!mediaUrl) {
-          const jsonMatch = html.match(/"url"\s*:\s*"(https:\/\/i\.pinimg\.com\/[^"]+)"/g)
-          if (jsonMatch) {
-            // Prefer originals / 1200x
-            const highRes = jsonMatch.find(u => u.includes("/originals/") || u.includes("1200x")) || jsonMatch[0]
-            mediaUrl = highRes.replace(/"url"\s*:\s*"/, "").replace(/"$/, "")
+          allMediaUrls.push(...unique)
+        } else {
+          // Single pin
+          let mediaUrl = null
+          const ogImage = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+          if (ogImage) mediaUrl = ogImage[1]
+
+          if (!mediaUrl) {
+            const match = html.match(/https:\/\/i\.pinimg\.com\/[^"'\s]+/g)
+            if (match) {
+              mediaUrl = match.find(u => u.includes("originals") || u.includes("1200x")) || match[0]
+            }
           }
+
+          if (mediaUrl) allMediaUrls.push(mediaUrl)
         }
 
-        // Method 3: Another common pattern
-        if (!mediaUrl) {
-          const match2 = html.match(/https:\/\/i\.pinimg\.com\/[^"'\s]+/g)
-          if (match2) {
-            mediaUrl = match2.find(u => u.includes("originals") || u.includes("1200x") || u.includes("736x")) || match2[0]
-          }
-        }
+      } catch (err) {
+        console.log("Error processing link:", err.message)
+        failed++
+      }
+    }
 
-        if (!mediaUrl) {
-          failed++
-          continue
-        }
+    // Remove duplicates
+    allMediaUrls = [...new Set(allMediaUrls)]
 
-        // Clean the URL
-        mediaUrl = mediaUrl.replace(/\\u002F/g, "/").replace(/&amp;/g, "&")
+    if (!allMediaUrls.length) {
+      await m.react("✘")
+      return await m.send("✘ No images found. Make sure the link is valid.")
+    }
 
-        const buff = await getBuffer(mediaUrl)
+    // Convert to stickers
+    for (const mediaUrl of allMediaUrls) {
+      try {
+        const cleanUrl = mediaUrl.replace(/\\u002F/g, "/").replace(/&amp;/g, "&")
+        const buff = await getBuffer(cleanUrl)
         if (!buff) {
           failed++
           continue
@@ -884,21 +895,15 @@ try {
           packname: stkpack,
           author: stkauthor
         })
-
         success++
-        await sleep(1000)
-
+        await sleep(1200)
       } catch (err) {
-        console.log("pstk single error:", err.message)
         failed++
       }
     }
 
     await m.react(success > 0 ? "✓" : "✘")
-
-    if (urls.length > 1 || failed > 0) {
-      await m.send(`✓ Finished\nSuccess: ${success}\nFailed: ${failed}`)
-    }
+    await m.send(`✓ Done\nSuccess: ${success}\nFailed: ${failed}`)
 
   } catch (e) {
     console.log("pstk error:", e)
