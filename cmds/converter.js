@@ -794,7 +794,13 @@ try {
 
 
  
- kord({
+ 
+ 
+ 
+ 
+
+
+kord({
   cmd: "pstk|pinsticker|pinstk",
   desc: "Convert Pinterest pins or board links to stickers",
   fromMe: wtype,
@@ -844,13 +850,25 @@ try {
         const isBoard = /\/board\//i.test(finalUrl) || html.includes('"board_id"') || html.includes('BoardResource')
 
         if (isBoard) {
-          // Extract multiple images from board
           const matches = html.match(/https:\/\/i\.pinimg\.com\/[^"'\s]+/g) || []
-          const unique = [...new Set(matches)]
-            .filter(u => u.includes("originals") || u.includes("1200x") || u.includes("736x") || u.includes("564x"))
-            .slice(0, 30) // Safety limit
 
-          allMediaUrls.push(...unique)
+          // Better unique filter - keep only the best quality per image
+          const seen = new Set()
+          const unique = []
+
+          for (const url of matches) {
+            // Extract the filename part (unique identity of the image)
+            const fileId = url.split("/").pop().split(".")[0]
+            if (seen.has(fileId)) continue
+            seen.add(fileId)
+
+            // Prefer higher quality
+            if (url.includes("originals") || url.includes("1200x") || url.includes("736x") || url.includes("564x")) {
+              unique.push(url)
+            }
+          }
+
+          allMediaUrls.push(...unique.slice(0, 30))
         } else {
           // Single pin
           let mediaUrl = null
@@ -873,7 +891,7 @@ try {
       }
     }
 
-    // Remove duplicates
+    // Final cleanup
     allMediaUrls = [...new Set(allMediaUrls)]
 
     if (!allMediaUrls.length) {

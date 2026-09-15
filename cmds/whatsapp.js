@@ -863,3 +863,107 @@ kord({
     if (bl.stk.includes(hash)) return await m.send(m, {}, "delete")
   }
 })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ // ========== ViewOnce Sticker System ==========
+
+kord({
+  cmd: "setvvsticker|setvvs",
+  desc: "Set a sticker as ViewOnce saver trigger",
+  fromMe: true,
+  type: "user",
+}, async (m) => {
+  try {
+    if (!m.quoted?.sticker) {
+      return await m.send("_*Reply to the sticker you want to use as VV trigger*_")
+    }
+
+    const stickerMsg = m.quoted
+    const stickerData = {
+      sha256: stickerMsg.fileSha256 ? Buffer.from(stickerMsg.fileSha256).toString('hex') : null,
+      mediaKey: stickerMsg.mediaKey ? Buffer.from(stickerMsg.mediaKey).toString('hex') : null,
+      setAt: new Date().toISOString()
+    }
+
+    if (!stickerData.sha256 && !stickerData.mediaKey) {
+      return await m.send("✘ Could not get sticker ID. Try another sticker.")
+    }
+
+    await storeData("vv_sticker", stickerData)
+    await m.react("✅")
+    return await m.send("✓ Sticker set as ViewOnce saver!\n\nNow reply any ViewOnce with this sticker to save it to your DM.")
+  } catch (e) {
+    console.log(e)
+    return await m.sendErr(e)
+  }
+})
+
+// Event listener
+kord({
+  on: "all",
+  fromMe: false,
+}, async (m) => {
+  try {
+    if (!m.sticker || !m.quoted) return
+
+    const saved = await getData("vv_sticker")
+    if (!saved) return
+
+    // Get current sticker ID
+    const currentSha = m.fileSha256 ? Buffer.from(m.fileSha256).toString('hex') : null
+    const currentKey = m.mediaKey ? Buffer.from(m.mediaKey).toString('hex') : null
+
+    // Check if it matches the saved sticker
+    const isMatch = (saved.sha256 && currentSha && saved.sha256 === currentSha) ||
+                    (saved.mediaKey && currentKey && saved.mediaKey === currentKey)
+
+    if (!isMatch) return
+
+    // Check if quoted is ViewOnce
+    const quoted = m.quoted
+    const isViewOnce = quoted.viewOnce || 
+                       quoted.message?.viewOnceMessage ||
+                       quoted.message?.viewOnceMessageV2 ||
+                       quoted.message?.viewOnceMessageV2Extension
+
+    if (!isViewOnce) return
+
+    let media
+    try {
+      media = await quoted.download()
+    } catch {
+      return
+    }
+
+    if (!media) return
+
+    const ownerJid = (config().OWNER_NUMBER || "").replace(/[^0-9]/g, "") + "@s.whatsapp.net"
+
+    let type = "image"
+    if (quoted.video || quoted.mtype?.includes("video")) type = "video"
+    else if (quoted.audio || quoted.mtype?.includes("audio")) type = "audio"
+
+    await m.client.sendMessage(ownerJid, {
+      [type]: media,
+      caption: `📥 *ViewOnce Saved*\nFrom: ${m.pushName || m.sender.split("@")[0]}`
+    })
+
+    await m.react("🥹")
+
+  } catch (e) {
+    console.log("vvsticker error:", e)
+  }
+})
