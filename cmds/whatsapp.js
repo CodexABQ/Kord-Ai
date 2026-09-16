@@ -878,7 +878,7 @@ kord({
 
 
 
- // ========== ViewOnce Sticker System ==========
+// ========== Improved ViewOnce Sticker System ==========
 
 kord({
   cmd: "setvvsticker|setvvs",
@@ -891,53 +891,40 @@ kord({
       return await m.send("_*Reply to the sticker you want to use as VV trigger*_")
     }
 
-    const stickerMsg = m.quoted
-    const stickerData = {
-      sha256: stickerMsg.fileSha256 ? Buffer.from(stickerMsg.fileSha256).toString('hex') : null,
-      mediaKey: stickerMsg.mediaKey ? Buffer.from(stickerMsg.mediaKey).toString('hex') : null,
-      setAt: new Date().toISOString()
-    }
+    const buffer = await m.quoted.download()
+    const hash = require("crypto").createHash("md5").update(buffer).digest("hex")
 
-    if (!stickerData.sha256 && !stickerData.mediaKey) {
-      return await m.send("✘ Could not get sticker ID. Try another sticker.")
-    }
-
-    await storeData("vv_sticker", stickerData)
+    await storeData("vv_sticker_hash", hash)
     await m.react("✅")
-    return await m.send("✓ Sticker set as ViewOnce saver!\n\nNow reply any ViewOnce with this sticker to save it to your DM.")
+    return await m.send("✓ Sticker set successfully!\n\nNow reply any ViewOnce with this sticker to save it.")
   } catch (e) {
     console.log(e)
     return await m.sendErr(e)
   }
 })
 
-// Event listener
 kord({
   on: "all",
-  fromMe: false,
 }, async (m) => {
   try {
     if (!m.sticker || !m.quoted) return
 
-    const saved = await getData("vv_sticker")
-    if (!saved) return
+    const savedHash = await getData("vv_sticker_hash")
+    if (!savedHash) return
 
-    // Get current sticker ID
-    const currentSha = m.fileSha256 ? Buffer.from(m.fileSha256).toString('hex') : null
-    const currentKey = m.mediaKey ? Buffer.from(m.mediaKey).toString('hex') : null
+    // Get hash of the sticker that was just sent
+    const buffer = await m.download()
+    const currentHash = require("crypto").createHash("md5").update(buffer).digest("hex")
 
-    // Check if it matches the saved sticker
-    const isMatch = (saved.sha256 && currentSha && saved.sha256 === currentSha) ||
-                    (saved.mediaKey && currentKey && saved.mediaKey === currentKey)
+    if (currentHash !== savedHash) return
 
-    if (!isMatch) return
-
-    // Check if quoted is ViewOnce
+    // Check if quoted message is ViewOnce
     const quoted = m.quoted
     const isViewOnce = quoted.viewOnce || 
                        quoted.message?.viewOnceMessage ||
                        quoted.message?.viewOnceMessageV2 ||
-                       quoted.message?.viewOnceMessageV2Extension
+                       quoted.message?.viewOnceMessageV2Extension ||
+                       quoted.mtype?.includes("viewOnce")
 
     if (!isViewOnce) return
 
@@ -945,18 +932,18 @@ kord({
     try {
       media = await quoted.download()
     } catch {
-      return
+      return await m.reply("✘ Failed to download ViewOnce")
     }
 
     if (!media) return
 
-    const ownerJid = (config().OWNER_NUMBER || "").replace(/[^0-9]/g, "") + "@s.whatsapp.net"
+    const owner = (config().OWNER_NUMBER || "").replace(/[^0-9]/g, "") + "@s.whatsapp.net"
 
     let type = "image"
     if (quoted.video || quoted.mtype?.includes("video")) type = "video"
     else if (quoted.audio || quoted.mtype?.includes("audio")) type = "audio"
 
-    await m.client.sendMessage(ownerJid, {
+    await m.client.sendMessage(owner, {
       [type]: media,
       caption: `📥 *ViewOnce Saved*\nFrom: ${m.pushName || m.sender.split("@")[0]}`
     })
