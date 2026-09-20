@@ -357,7 +357,7 @@ const ZX = {
   HISTORY_TURNS: 10,
   MAX_FACTS: 8,
   CONFIRM_TIMEOUT: 45000,
-  GROQ_MODEL: "llama-3.3-70b-versatile",
+  GROQ_MODEL: "openai/gpt-oss-120b",
 }
 
 const MOODS = ["savage", "laughing", "done", "smug", "soft", "flirty", "neutral"]
