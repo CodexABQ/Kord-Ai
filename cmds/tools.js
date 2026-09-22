@@ -767,3 +767,680 @@ kord({
     return await m.sendErr(e)
   }
 })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ /* 
+ * Marketplace system for Kord-Ai
+ * Private owner-only product & request queue + group posting helper
+ */
+
+
+
+const MEDIA_DIR = path.join(__dirname, "..", "media", "marketplace")
+const DATA_KEY = "marketplace_listings"
+const GROUPS_KEY = "marketplace_groups"
+const INACTIVE_DAYS = 3
+
+if (!fs.existsSync(MEDIA_DIR)) {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true })
+}
+
+// ── Helpers ──────────────────────────────────────────────
+
+function generateId(type) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+  let id = ""
+  for (let i = 0; i < 4; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)]
+  }
+  return (type === "request" ? "R" : "S") + id
+}
+
+async function loadListings() {
+  const data = await getData(DATA_KEY)
+  if (!data || typeof data !== "object") return {}
+  if (typeof data === "string") {
+    try { return JSON.parse(data) } catch { return {} }
+  }
+  return data
+}
+
+async function saveListings(listings) {
+  await storeData(DATA_KEY, JSON.stringify(listings, null, 2))
+}
+
+async function loadGroups() {
+  const data = await getData(GROUPS_KEY)
+  if (!data) return []
+  if (typeof data === "string") {
+    try { return JSON.parse(data) } catch { return [] }
+  }
+  if (Array.isArray(data)) return data
+  return []
+}
+
+async function saveGroups(groups) {
+  await storeData(GROUPS_KEY, JSON.stringify(groups, null, 2))
+}
+
+function cleanNumber(num) {
+  if (!num) return ""
+  return String(num).replace(/\D/g, "")
+}
+
+async function downloadMedia(m) {
+  const files = []
+  try {
+    if (m.quoted) {
+      if (m.quoted.image || m.quoted.video || m.quoted.document || m.quoted.audio) {
+        const buffer = await m.quoted.download()
+        if (buffer) {
+          const ext = m.quoted.image ? ".jpg"
+            : m.quoted.video ? ".mp4"
+            : m.quoted.audio ? ".ogg"
+            : ".bin"
+          files.push({ buffer, ext, mimetype: m.quoted.mimetype || "" })
+        }
+      }
+    }
+  } catch (e) {
+    console.log("marketplace media download error:", e.message)
+  }
+  return files
+}
+
+async function saveMediaFiles(id, mediaFiles) {
+  const dir = path.join(MEDIA_DIR, id)
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+
+  const saved = []
+  const existing = fs.readdirSync(dir).length
+
+  for (let i = 0; i < mediaFiles.length; i++) {
+    const f = mediaFiles[i]
+    const filename = `\( {existing + i + 1} \){f.ext}`
+    const filepath = path.join(dir, filename)
+    fs.writeFileSync(filepath, f.buffer)
+    saved.push({ path: filepath, filename, mimetype: f.mimetype, ext: f.ext })
+  }
+  return saved
+}
+
+function getMediaList(id) {
+  const dir = path.join(MEDIA_DIR, id)
+  if (!fs.existsSync(dir)) return []
+  return fs.readdirSync(dir)
+    .filter(f => !f.startsWith("."))
+    .map(f => ({ path: path.join(dir, f), filename: f }))
+}
+
+async function cleanupInactive() {
+  const listings = await loadListings()
+  const now = Date.now()
+  const limit = INACTIVE_DAYS * 24 * 60 * 60 * 1000
+  let changed = false
+
+  for (const id of Object.keys(listings)) {
+    const item = listings[id]
+    if (item.status === "inactive" && item.inactiveAt) {
+      if (now - item.inactiveAt > limit) {
+        const dir = path.join(MEDIA_DIR, id)
+        if (fs.existsSync(dir)) {
+          fs.rmSync(dir, { recursive: true, force: true })
+        }
+        delete listings[id]
+        changed = true
+      }
+    }
+  }
+  if (changed) await saveListings(listings)
+}
+
+cleanupInactive().catch(() => {})
+
+// ── Commands ─────────────────────────────────────────────
+
+// MPSSELL
+kord({
+  cmd: "mpsell",
+  desc: "Add product for sale (reply to media). Use mpsell ID to add more media",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    await cleanupInactive()
+    const arg = (text || "").trim()
+    const listings = await loadListings()
+
+    // Add media to existing product
+    if (arg && listings[arg.toUpperCase()]) {
+      const id = arg.toUpperCase()
+      if (listings[id].type !== "sell") {
+        return await m.send(`_#${id} is a request, use mprequest ${id} instead_`)
+      }
+      if (!m.quoted || !(m.quoted.image || m.quoted.video || m.quoted.document)) {
+        return await m.send(`_Reply to a photo/video with *${prefix}mpsell ${id}* to add media_`)
+      }
+      const mediaFiles = await downloadMedia(m)
+      if (!mediaFiles.length) return await m.send("_Could not download media_")
+      const saved = await saveMediaFiles(id, mediaFiles)
+      listings[id].mediaCount = (listings[id].mediaCount || 0) + saved.length
+      listings[id].updatedAt = Date.now()
+      await saveListings(listings)
+      return await m.send(`✓ Added *\( {saved.length}* media to product *# \){id}*\n_Total media: ${listings[id].mediaCount}_`)
+    }
+
+    // Create new product
+    if (!m.quoted || !(m.quoted.image || m.quoted.video || m.quoted.document)) {
+      return await m.send(
+        `_Reply to a photo/video with *${prefix}mpsell*_\n` +
+        `_Or reply with *${prefix}mpsell ID* to add media to existing product_`
+      )
+    }
+
+    const mediaFiles = await downloadMedia(m)
+    if (!mediaFiles.length) return await m.send("_Could not download media_")
+
+    let id = generateId("sell")
+    while (listings[id]) id = generateId("sell")
+
+    const saved = await saveMediaFiles(id, mediaFiles)
+
+    let ownerNumber = cleanNumber(arg)
+    if (!ownerNumber && m.quoted?.participant) ownerNumber = cleanNumber(m.quoted.participant)
+    if (!ownerNumber && m.quoted?.sender) ownerNumber = cleanNumber(m.quoted.sender)
+
+    listings[id] = {
+      id,
+      type: "sell",
+      caption: "",
+      ownerNumber: ownerNumber || "",
+      mediaCount: saved.length,
+      status: "active",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      inactiveAt: null
+    }
+    await saveListings(listings)
+
+    let msg = `✓ Product added → *#${id}*\n_Media: ${saved.length}_`
+    if (ownerNumber) msg += `\n_Owner saved: ${ownerNumber}_`
+    msg += `\n\n_Set caption:_ *${prefix}mpedit ${id} Your caption here*`
+    if (!ownerNumber) msg += `\n_Set owner:_ *${prefix}mpowner ${id} 234xxxxxxxxxx*`
+    return await m.send(msg)
+  } catch (e) {
+    console.log("mpsell error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPREQUEST
+kord({
+  cmd: "mprequest",
+  desc: "Add a request (looking for). Can attach media",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    await cleanupInactive()
+    const arg = (text || "").trim()
+    const listings = await loadListings()
+
+    if (arg && listings[arg.toUpperCase()]) {
+      const id = arg.toUpperCase()
+      if (listings[id].type !== "request") {
+        return await m.send(`_#${id} is a sell product, use mpsell ${id} instead_`)
+      }
+      if (!m.quoted || !(m.quoted.image || m.quoted.video || m.quoted.document)) {
+        return await m.send(`_Reply to a photo/video with *${prefix}mprequest ${id}* to add media_`)
+      }
+      const mediaFiles = await downloadMedia(m)
+      if (!mediaFiles.length) return await m.send("_Could not download media_")
+      const saved = await saveMediaFiles(id, mediaFiles)
+      listings[id].mediaCount = (listings[id].mediaCount || 0) + saved.length
+      listings[id].updatedAt = Date.now()
+      await saveListings(listings)
+      return await m.send(`✓ Added *\( {saved.length}* media to request *# \){id}*\n_Total media: ${listings[id].mediaCount}_`)
+    }
+
+    const hasMedia = m.quoted && (m.quoted.image || m.quoted.video || m.quoted.document)
+    const captionText = arg || (m.quoted?.text || "")
+
+    if (!hasMedia && !captionText) {
+      return await m.send(
+        `_Usage:_\n` +
+        `*${prefix}mprequest Looking for PS5*\n` +
+        `_Or reply to media with *${prefix}mprequest*_\n` +
+        `_Or reply with *${prefix}mprequest ID* to add media_`
+      )
+    }
+
+    let id = generateId("request")
+    while (listings[id]) id = generateId("request")
+
+    let mediaCount = 0
+    if (hasMedia) {
+      const mediaFiles = await downloadMedia(m)
+      if (mediaFiles.length) {
+        const saved = await saveMediaFiles(id, mediaFiles)
+        mediaCount = saved.length
+      }
+    }
+
+    let ownerNumber = ""
+    if (m.quoted?.participant) ownerNumber = cleanNumber(m.quoted.participant)
+    else if (m.quoted?.sender) ownerNumber = cleanNumber(m.quoted.sender)
+
+    listings[id] = {
+      id,
+      type: "request",
+      caption: captionText || "",
+      ownerNumber: ownerNumber || "",
+      mediaCount,
+      status: "active",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      inactiveAt: null
+    }
+    await saveListings(listings)
+
+    let msg = `✓ Request added → *#${id}*`
+    if (captionText) msg += `\n_${captionText}_`
+    if (mediaCount) msg += `\n_Media: ${mediaCount}_`
+    if (!captionText) msg += `\n\n_Set caption:_ *${prefix}mpedit ${id} Looking for ...*`
+    return await m.send(msg)
+  } catch (e) {
+    console.log("mprequest error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPEDIT
+kord({
+  cmd: "mpedit",
+  desc: "Set or update caption for a product/request",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    const parts = (text || "").trim().split(/\s+/)
+    const id = (parts[0] || "").toUpperCase()
+    const caption = parts.slice(1).join(" ").trim()
+
+    if (!id || !caption) {
+      return await m.send(`_Usage: *${prefix}mpedit A7K2 Clean used iPhone 16 available*_`)
+    }
+
+    const listings = await loadListings()
+    if (!listings[id]) return await m.send(`_No item found with ID *#${id}*_`)
+
+    listings[id].caption = caption
+    listings[id].updatedAt = Date.now()
+    await saveListings(listings)
+    return await m.send(`✓ Caption updated for *#\( {id}*\n\n \){caption}`)
+  } catch (e) {
+    console.log("mpedit error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPOWNER
+kord({
+  cmd: "mpowner",
+  desc: "Get or set the private owner number of an item",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    const parts = (text || "").trim().split(/\s+/)
+    const id = (parts[0] || "").toUpperCase()
+    const number = cleanNumber(parts[1] || "")
+
+    if (!id) return await m.send(`_Usage:_\n*\( {prefix}mpowner A7K2* → get owner\n* \){prefix}mpowner A7K2 234xxx* → set owner`)
+
+    const listings = await loadListings()
+    if (!listings[id]) return await m.send(`_No item found with ID *#${id}*_`)
+
+    if (number) {
+      listings[id].ownerNumber = number
+      listings[id].updatedAt = Date.now()
+      await saveListings(listings)
+      return await m.send(`✓ Owner set for *#\( {id}*\n\` \){number}\``)
+    }
+
+    const owner = listings[id].ownerNumber
+    if (!owner) return await m.send(`_No owner number saved for *#\( {id}*\nSet with: * \){prefix}mpowner ${id} 234xxxxxxxxxx*_`)
+    return await m.send(`*Owner of #\( {id}:*\n\` \){owner}\``)
+  } catch (e) {
+    console.log("mpowner error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPREMOVE
+kord({
+  cmd: "mpremove",
+  desc: "Mark a product/request as inactive (auto-deleted after 3 days)",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    const id = (text || "").trim().toUpperCase()
+    if (!id) return await m.send(`_Usage: *${prefix}mpremove A7K2*_`)
+
+    const listings = await loadListings()
+    if (!listings[id]) return await m.send(`_No item found with ID *#${id}*_`)
+
+    listings[id].status = "inactive"
+    listings[id].inactiveAt = Date.now()
+    listings[id].updatedAt = Date.now()
+    await saveListings(listings)
+    return await m.send(`✓ *#${id}* marked inactive\n_Will be auto-deleted after ${INACTIVE_DAYS} days_`)
+  } catch (e) {
+    console.log("mpremove error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPLIST
+kord({
+  cmd: "mplist",
+  desc: "List marketplace items. Options: sell, request, owner",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    await cleanupInactive()
+    const filter = (text || "").trim().toLowerCase()
+    const listings = await loadListings()
+    const items = Object.values(listings).filter(i => i.status === "active")
+
+    let filtered = items
+    if (filter === "sell") filtered = items.filter(i => i.type === "sell")
+    else if (filter === "request") filtered = items.filter(i => i.type === "request")
+
+    if (!filtered.length) return await m.send("_No active items_")
+
+    if (filter === "owner") {
+      let msg = `*Marketplace — All Active (${items.length})*\n\n`
+      for (const item of items) {
+        const typeLabel = item.type === "sell" ? "SELL" : "REQ"
+        msg += `*#\( {item.id}* [ \){typeLabel}]\n`
+        msg += item.caption ? `${item.caption}\n` : `_No caption_\n`
+        msg += `Owner: ${item.ownerNumber || "_not set_"}\n`
+        msg += `Media: ${item.mediaCount || 0}\n\n`
+      }
+      return await m.send(msg.trim())
+    }
+
+    let msg = `*Marketplace* — ${filtered.length} active`
+    if (filter === "sell") msg += " (sell only)"
+    if (filter === "request") msg += " (requests only)"
+    msg += "\n\n"
+
+    for (const item of filtered) {
+      const typeLabel = item.type === "sell" ? "S" : "R"
+      const cap = item.caption
+        ? (item.caption.length > 40 ? item.caption.slice(0, 40) + "…" : item.caption)
+        : "_no caption_"
+      msg += `*#\( {item.id}* [ \){typeLabel}] ${cap} · ${item.mediaCount || 0} media\n`
+    }
+
+    msg += `\n_Use *${prefix}mplist owner* for full list + numbers_`
+    return await m.send(msg.trim())
+  } catch (e) {
+    console.log("mplist error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPVIEW
+kord({
+  cmd: "mpview",
+  desc: "View full details of one marketplace item",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    const id = (text || "").trim().toUpperCase()
+    if (!id) return await m.send(`_Usage: *${prefix}mpview A7K2*_`)
+
+    const listings = await loadListings()
+    const item = listings[id]
+    if (!item) return await m.send(`_No item found with ID *#${id}*_`)
+
+    const typeLabel = item.type === "sell" ? "FOR SALE" : "REQUEST"
+    let msg = `*#${item.id}* — ${typeLabel}\n`
+    msg += `Status: ${item.status}\n`
+    msg += `Caption: ${item.caption || "_none_"}\n`
+    msg += `Owner: ${item.ownerNumber || "_not set_"}\n`
+    msg += `Media files: ${item.mediaCount || 0}\n`
+    msg += `Created: ${new Date(item.createdAt).toLocaleString()}`
+
+    await m.send(msg)
+
+    const media = getMediaList(id)
+    for (const file of media) {
+      try {
+        const buffer = fs.readFileSync(file.path)
+        const isVideo = file.filename.endsWith(".mp4")
+        await m.send(buffer, { caption: `#${id}` }, isVideo ? "video" : "image")
+      } catch (e) {
+        console.log("mpview media send error", e.message)
+      }
+    }
+  } catch (e) {
+    console.log("mpview error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPGROUP
+kord({
+  cmd: "mpgroup",
+  desc: "Manage groups for marketplace posting (add/remove/list)",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    const arg = (text || "").trim().toLowerCase()
+    const groups = await loadGroups()
+
+    if (arg === "add") {
+      if (!m.chat.endsWith("@g.us")) {
+        return await m.send("_This command must be used *inside* the group you want to add_\n_(or bind a sticker with setcmd while in the group)_")
+      }
+      if (groups.includes(m.chat)) {
+        try {
+          await m.client.sendMessage(m.ownerJid || m.sender, {
+            text: `⚠ Group already in list:\n${m.chat}`
+          })
+        } catch {}
+        return await m.send("_Group already in marketplace list_")
+      }
+      groups.push(m.chat)
+      await saveGroups(groups)
+
+      try {
+        let gName = m.chat
+        try {
+          const meta = await m.client.groupMetadata(m.chat)
+          gName = meta.subject || m.chat
+        } catch {}
+        await m.client.sendMessage(m.ownerJid || m.sender, {
+          text: `✓ Group added to marketplace\n*\( {gName}*\n\` \){m.chat}\`\n\nTotal groups: ${groups.length}`
+        })
+      } catch {}
+
+      return await m.send(`✓ Group added\n_Total: ${groups.length}_`)
+    }
+
+    if (arg === "remove") {
+      if (!m.chat.endsWith("@g.us")) {
+        return await m.send("_Use this *inside* the group you want to remove_")
+      }
+      const idx = groups.indexOf(m.chat)
+      if (idx === -1) {
+        try {
+          await m.client.sendMessage(m.ownerJid || m.sender, {
+            text: `⚠ Group was not in marketplace list:\n${m.chat}`
+          })
+        } catch {}
+        return await m.send("_Group is not in the list_")
+      }
+      groups.splice(idx, 1)
+      await saveGroups(groups)
+
+      try {
+        await m.client.sendMessage(m.ownerJid || m.sender, {
+          text: `✓ Group removed from marketplace\n\`${m.chat}\`\n\nTotal groups: ${groups.length}`
+        })
+      } catch {}
+
+      return await m.send(`✓ Group removed\n_Total: ${groups.length}_`)
+    }
+
+    if (arg === "list" || !arg) {
+      if (!groups.length) return await m.send("_No groups added yet_\n_Go to a group and use *mpgroup add*_")
+
+      let msg = `*Marketplace Groups (${groups.length})*\n\n`
+      for (let i = 0; i < groups.length; i++) {
+        let name = groups[i]
+        try {
+          const meta = await m.client.groupMetadata(groups[i])
+          name = meta.subject || groups[i]
+        } catch {}
+        msg += `${i + 1}. \( {name}\n\` \){groups[i]}\`\n\n`
+      }
+      return await m.send(msg.trim())
+    }
+
+    if (arg === "clear") {
+      await saveGroups([])
+      return await m.send("_All marketplace groups cleared_")
+    }
+
+    return await m.send(
+      `*mpgroup* usage:\n` +
+      `• *${prefix}mpgroup add* — add current group\n` +
+      `• *${prefix}mpgroup remove* — remove current group\n` +
+      `• *${prefix}mpgroup list* — show saved groups\n` +
+      `• *${prefix}mpgroup clear* — remove all`
+    )
+  } catch (e) {
+    console.log("mpgroup error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPPOST
+kord({
+  cmd: "mppost",
+  desc: "Post active marketplace items to your saved groups",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    await cleanupInactive()
+    const listings = await loadListings()
+    const groups = await loadGroups()
+    const active = Object.values(listings).filter(i => i.status === "active")
+
+    if (!active.length) return await m.send("_No active items to post_")
+    if (!groups.length) return await m.send("_No groups saved. Use *mpgroup add* inside a group first_")
+
+    const arg = (text || "").trim().toLowerCase()
+
+    if (!arg || arg === "preview") {
+      let msg = `*Ready to post*\n\n`
+      msg += `Active items: *${active.length}*\n`
+      msg += `Groups: *${groups.length}*\n\n`
+      msg += `Items:\n`
+      for (const item of active.slice(0, 15)) {
+        const t = item.type === "sell" ? "S" : "R"
+        const cap = item.caption ? item.caption.slice(0, 30) : "_no caption_"
+        msg += `• #\( {item.id} [ \){t}] ${cap}\n`
+      }
+      if (active.length > 15) msg += `... and ${active.length - 15} more\n`
+      msg += `\n_Reply with *${prefix}mppost go* to start posting_\n`
+      msg += `_Or *${prefix}mppost go SXXXX* to post only one item_`
+      return await m.send(msg)
+    }
+
+    let toPost = active
+    if (arg.startsWith("go")) {
+      const parts = arg.split(/\s+/).slice(1)
+      if (parts.length) {
+        toPost = parts
+          .map(p => listings[p.toUpperCase()])
+          .filter(i => i && i.status === "active")
+        if (!toPost.length) return await m.send("_None of those IDs are active_")
+      }
+    } else {
+      return await m.send(`_Use *\( {prefix}mppost* for preview, or * \){prefix}mppost go* to post_`)
+    }
+
+    await m.send(`_Posting *\( {toPost.length}* item(s) to * \){groups.length}* group(s)..._\n_This may take a moment_`)
+
+    let success = 0
+    let fail = 0
+
+    for (const item of toPost) {
+      const caption = item.caption || `#${item.id}`
+      const media = getMediaList(item.id)
+
+      for (const groupJid of groups) {
+        try {
+          if (media.length === 0) {
+            await m.client.sendMessage(groupJid, { text: caption })
+          } else if (media.length === 1) {
+            const buffer = fs.readFileSync(media[0].path)
+            const isVideo = media[0].filename.endsWith(".mp4")
+            await m.client.sendMessage(groupJid, {
+              [isVideo ? "video" : "image"]: buffer,
+              caption
+            })
+          } else {
+            for (let i = 0; i < media.length; i++) {
+              const buffer = fs.readFileSync(media[i].path)
+              const isVideo = media[i].filename.endsWith(".mp4")
+              await m.client.sendMessage(groupJid, {
+                [isVideo ? "video" : "image"]: buffer,
+                caption: i === 0 ? caption : undefined
+              })
+              await new Promise(r => setTimeout(r, 800))
+            }
+          }
+          success++
+          await new Promise(r => setTimeout(r, 1500))
+        } catch (e) {
+          console.log(`mppost fail ${groupJid}:`, e.message)
+          fail++
+        }
+      }
+    }
+
+    return await m.send(`✓ Posting done\n_Success: ${success}_\n_Failed: ${fail}_`)
+  } catch (e) {
+    console.log("mppost error", e)
+    return await m.sendErr(e)
+  }
+})
