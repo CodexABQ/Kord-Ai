@@ -893,7 +893,7 @@ async function saveMediaFiles(id, mediaFiles) {
     const f = mediaFiles[i]
     if (!f.buffer || f.buffer.length < 100) continue
 
-    const filename = `\( {Date.now()}_ \){existing + i + 1}${f.ext}`
+    const filename = `${Date.now()}_${existing + i + 1}${f.ext}`
     const filepath = path.join(dir, filename)
     fs.writeFileSync(filepath, f.buffer)
     saved.push({
@@ -960,7 +960,8 @@ kord({
 • *${prefix}mpsell* — reply to media → new product
 • *${prefix}mpsell ID* — add media to that product
 • *${prefix}mpadd* — add media to latest product
-• *${prefix}mpedit ID caption* — set caption
+• *${prefix}mpedit caption* — set caption on latest product
+• *${prefix}mpedit ID caption* — set caption on that ID
 • *${prefix}mpowner ID* — get owner number
 • *${prefix}mpowner ID 234xxx* — set owner number
 • *${prefix}mpdelete* — reply to a post OR use ID
@@ -1024,7 +1025,7 @@ kord({
       listings[id].mediaCount = (listings[id].mediaCount || 0) + saved.length
       listings[id].updatedAt = Date.now()
       await saveListings(listings)
-      return await m.send(`✓ Added *\( {saved.length}* media to *# \){id}*\n_Total media: ${listings[id].mediaCount}_`)
+      return await m.send(`✓ Added *${saved.length}* media to *#${id}*\n_Total media: ${listings[id].mediaCount}_`)
     }
 
     if (!m.quoted && !(m.image || m.video)) {
@@ -1088,7 +1089,7 @@ kord({
       return await m.send(`_No active product found._\n_Create one with *${prefix}mpsell*_`)
     }
     if (!m.quoted && !(m.image || m.video)) {
-      return await m.send(`_Reply to a photo/video with *\( {prefix}mpadd*_\n_Latest product: *# \){latest.id}*_`)
+      return await m.send(`_Reply to a photo/video with *${prefix}mpadd*_\n_Latest product: *#${latest.id}*_`)
     }
 
     const mediaFiles = await downloadMedia(m)
@@ -1099,7 +1100,7 @@ kord({
     listings[latest.id].updatedAt = Date.now()
     await saveListings(listings)
 
-    return await m.send(`✓ Added *\( {saved.length}* media to *# \){latest.id}*\n_Total media: ${listings[latest.id].mediaCount}_`)
+    return await m.send(`✓ Added *${saved.length}* media to *#${latest.id}*\n_Total media: ${listings[latest.id].mediaCount}_`)
   } catch (e) {
     console.log("mpadd error", e)
     return await m.sendErr(e)
@@ -1132,7 +1133,7 @@ kord({
       listings[id].mediaCount = (listings[id].mediaCount || 0) + saved.length
       listings[id].updatedAt = Date.now()
       await saveListings(listings)
-      return await m.send(`✓ Added *\( {saved.length}* media to request *# \){id}*\n_Total: ${listings[id].mediaCount}_`)
+      return await m.send(`✓ Added *${saved.length}* media to request *#${id}*\n_Total: ${listings[id].mediaCount}_`)
     }
 
     const hasMedia = m.quoted || m.image || m.video
@@ -1186,28 +1187,50 @@ kord({
 })
 
 // MPEDIT
+// Usage:
+//   mpedit Your caption            -> sets caption on the latest active sell product
+//   mpedit ID Your caption         -> sets caption on that specific ID (sell or request)
 kord({
   cmd: "mpedit",
-  desc: "Set or update caption",
+  desc: "Set or update caption (latest product if no ID given)",
   fromMe: true,
   type: "marketplace",
 }, async (m, text) => {
   try {
-    const parts = (text || "").trim().split(/\s+/)
-    const id = (parts[0] || "").toUpperCase()
-    const caption = parts.slice(1).join(" ").trim()
-
-    if (!id || !caption) {
-      return await m.send(`_Usage: *${prefix}mpedit SUSYY iPhone 13 for sale*_`)
+    const raw = (text || "").trim()
+    if (!raw) {
+      return await m.send(
+        `_Usage:_\n*${prefix}mpedit Your caption* — edits latest product\n*${prefix}mpedit SUSYY Your caption* — edits that ID`
+      )
     }
 
     const listings = await loadListings()
-    if (!listings[id]) return await m.send(`_No item found with ID *#${id}*_`)
+    const parts = raw.split(/\s+/)
+    const possibleId = (parts[0] || "").toUpperCase()
+
+    let id, caption
+
+    if (listings[possibleId]) {
+      // First token matches an existing ID -> treat rest as caption
+      id = possibleId
+      caption = parts.slice(1).join(" ").trim()
+      if (!caption) {
+        return await m.send(`_Usage: *${prefix}mpedit ${id} Your caption*_`)
+      }
+    } else {
+      // No valid ID given -> fall back to latest active product
+      const latest = getLatestProduct(listings)
+      if (!latest) {
+        return await m.send(`_No active product found._\n_Create one with *${prefix}mpsell*, or specify an ID: *${prefix}mpedit SUSYY Your caption*_`)
+      }
+      id = latest.id
+      caption = raw
+    }
 
     listings[id].caption = caption
     listings[id].updatedAt = Date.now()
     await saveListings(listings)
-    return await m.send(`✓ Caption updated for *#\( {id}*\n\n \){caption}`)
+    return await m.send(`✓ Caption updated for *#${id}*\n\n${caption}`)
   } catch (e) {
     console.log("mpedit error", e)
     return await m.sendErr(e)
@@ -1227,7 +1250,7 @@ kord({
     const number = cleanNumber(parts[1] || "")
 
     if (!id) {
-      return await m.send(`_Usage:_\n*\( {prefix}mpowner SUSYY*\n* \){prefix}mpowner SUSYY 234xxxxxxxxxx*`)
+      return await m.send(`_Usage:_\n*${prefix}mpowner SUSYY*\n*${prefix}mpowner SUSYY 234xxxxxxxxxx*`)
     }
 
     const listings = await loadListings()
@@ -1237,14 +1260,14 @@ kord({
       listings[id].ownerNumber = number
       listings[id].updatedAt = Date.now()
       await saveListings(listings)
-      return await m.send(`✓ Owner set for *#\( {id}*\n\` \){number}\``)
+      return await m.send(`✓ Owner set for *#${id}*\n\`${number}\``)
     }
 
     const owner = listings[id].ownerNumber
     if (!owner) {
-      return await m.send(`_No owner saved for *#\( {id}*_\n_Set with: * \){prefix}mpowner ${id} 234xxxxxxxxxx*_`)
+      return await m.send(`_No owner saved for *#${id}*_\n_Set with: *${prefix}mpowner ${id} 234xxxxxxxxxx*_`)
     }
-    return await m.send(`*Owner of #\( {id}:*\n\` \){owner}\``)
+    return await m.send(`*Owner of #${id}:*\n\`${owner}\``)
   } catch (e) {
     console.log("mpowner error", e)
     return await m.sendErr(e)
@@ -1339,7 +1362,7 @@ kord({
       let msg = `*Marketplace — Active (${items.length})*\n\n`
       for (const item of items) {
         const typeLabel = item.type === "sell" ? "SELL" : "REQ"
-        msg += `*#\( {item.id}* [ \){typeLabel}]\n`
+        msg += `*#${item.id}* [${typeLabel}]\n`
         msg += `${item.caption || "_No caption_"}\n`
         msg += `Owner: ${item.ownerNumber || "_not set_"}\n`
         msg += `Media: ${item.mediaCount || 0}\n\n`
@@ -1357,7 +1380,7 @@ kord({
       const cap = item.caption
         ? (item.caption.length > 40 ? item.caption.slice(0, 40) + "…" : item.caption)
         : "_no caption_"
-      msg += `*#\( {item.id}* [ \){typeLabel}] ${cap} · ${item.mediaCount || 0} media\n`
+      msg += `*#${item.id}* [${typeLabel}] ${cap} · ${item.mediaCount || 0} media\n`
     }
 
     msg += `\n_Use *${prefix}mplist owner* for full details + numbers_`
@@ -1450,7 +1473,7 @@ async function handleGroupAdd(m) {
   } catch {}
 
   await silentReact("✅")
-  await notifyOwner(`✓ Group added\n*\( {gName}*\n\` \){m.chat}\`\n\nTotal: ${groups.length}`)
+  await notifyOwner(`✓ Group added\n*${gName}*\n\`${m.chat}\`\n\nTotal: ${groups.length}`)
 }
 
 async function handleGroupRemove(m) {
@@ -1540,7 +1563,7 @@ kord({
           const meta = await m.client.groupMetadata(groups[i])
           name = meta.subject || groups[i]
         } catch {}
-        msg += `${i + 1}. \( {name}\n\` \){groups[i]}\`\n\n`
+        msg += `${i + 1}. ${name}\n\`${groups[i]}\`\n\n`
       }
       return await m.send(msg.trim())
     }
@@ -1552,8 +1575,8 @@ kord({
 
     return await m.send(
       `*mpgroup* usage:\n` +
-      `• *\( {prefix}mpgadd* / * \){prefix}mpgroup add*\n` +
-      `• *\( {prefix}mpgremove* / * \){prefix}mpgroup remove*\n` +
+      `• *${prefix}mpgadd* / *${prefix}mpgroup add*\n` +
+      `• *${prefix}mpgremove* / *${prefix}mpgroup remove*\n` +
       `• *${prefix}mpgroup list*\n` +
       `• *${prefix}mpgroup clear*`
     )
@@ -1589,7 +1612,7 @@ kord({
       for (const item of active.slice(0, 15)) {
         const t = item.type === "sell" ? "S" : "R"
         const cap = item.caption ? item.caption.slice(0, 30) : "_no caption_"
-        msg += `• #\( {item.id} [ \){t}] ${cap}\n`
+        msg += `• #${item.id} [${t}] ${cap}\n`
       }
       if (active.length > 15) msg += `... +${active.length - 15} more\n`
       msg += `\n_Reply *${prefix}mppost go* to post all_\n`
@@ -1607,10 +1630,10 @@ kord({
         if (!toPost.length) return await m.send("_None of those IDs are active_")
       }
     } else {
-      return await m.send(`_Use *\( {prefix}mppost* or * \){prefix}mppost go*_`)
+      return await m.send(`_Use *${prefix}mppost* or *${prefix}mppost go*_`)
     }
 
-    await m.send(`_Posting *\( {toPost.length}* item(s) to * \){groups.length}* group(s)..._`)
+    await m.send(`_Posting *${toPost.length}* item(s) to *${groups.length}* group(s)..._`)
 
     let success = 0
     let fail = 0
