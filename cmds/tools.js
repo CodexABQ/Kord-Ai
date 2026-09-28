@@ -787,21 +787,22 @@ kord({
 
 
 
-/*
+ /*
  * Marketplace system for Kord-Ai (fixed version)
  * Paste at the bottom of an existing cmds file
  */
 
-
 const MEDIA_DIR = path.join(__dirname, "..", "media", "marketplace")
 const DATA_KEY = "marketplace_listings"
 const GROUPS_KEY = "marketplace_groups"
+const MSGMAP_KEY = "marketplace_msgmap" // sent message id -> item id (for mpdelete by reply)
+const MSGMAP_MAX = 3000
 const INACTIVE_DAYS = 3
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000 // hourly
 
 // ── Anti-ban settings for mppost (tweak to taste) ────────
 const MAX_ITEMS_PER_RUN = 10          // max items posted per "mppost go"
-const MAX_MEDIA_PER_POST = 5          // max media files sent per item per group
+const MAX_MEDIA_PER_POST = 10         // max media per album (WhatsApp album limit is 10)
 const MEDIA_DELAY = [2500, 4500]      // ms between media in the same post
 const GROUP_DELAY = [8000, 15000]     // ms between groups
 const ITEM_DELAY = [15000, 30000]     // ms between items
@@ -834,6 +835,7 @@ function createLock() {
 
 const listingsLock = createLock()
 const groupsLock = createLock()
+const msgMapLock = createLock()
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms))
@@ -901,6 +903,129 @@ function mutateGroups(mutator) {
     if (!(result && result.skipSave)) await saveGroups(groups)
     return result
   })
+}
+
+async function loadMsgMap() {
+  let data = await getData(MSGMAP_KEY)
+  if (!data) return {}
+  if (typeof data === "string") {
+    try { return JSON.parse(data) } catch { return {} }
+  }
+  return data
+}
+
+async function saveMsgMap(map) {
+  await storeData(MSGMAP_KEY, JSON.stringify(map))
+}
+
+function mutateMsgMap(mutator) {
+  return msgMapLock(async () => {
+    const map = await loadMsgMap()
+    await mutator(map)
+    await saveMsgMap(map)
+  })
+}
+
+// Remember which WhatsApp messages belong to which item, so replying to a post with mpdelete works
+async function recordSent(itemId, ids) {
+  ids = (ids || []).filter(Boolean)
+  if (!ids.length) return
+  try {
+    await mutateMsgMap(async (map) => {
+      for (const id of ids) map[id] = itemId
+      const keys = Object.keys(map)
+      if (keys.length > MSGMAP_MAX) {
+        for (const k of keys.slice(0, keys.length - MSGMAP_MAX)) delete map[k]
+      }
+    })
+  } catch (e) {
+    console.log("marketplace msgmap error:", e.message)
+  }
+}
+
+// Load whichever baileys package the bot uses (needed to build real WhatsApp albums)
+let baileysLib = null
+for (const name of ["baileys", "@whiskeysockets/baileys", "@adiwajshing/baileys"]) {
+  try { baileysLib = require(name); break } catch {}
+}
+
+function mediaContent(file, caption) {
+  const content = file.kind === "video"
+    ? { video: file.buffer, mimetype: file.mimetype }
+    : { image: file.buffer, mimetype: file.mimetype }
+  if (caption) content.caption = caption
+  return content
+}
+
+// Sends all media as ONE album message with a single caption
+async function sendAlbumManual(client, jid, files, caption) {
+  if (!baileysLib || !baileysLib.generateWAMessageFromContent || !baileysLib.generateWAMessage) {
+    throw new Error("baileys helpers not found")
+  }
+  const { generateWAMessageFromContent, generateWAMessage } = baileysLib
+
+  const imageCount = files.filter(f => f.kind === "image").length
+  const videoCount = files.length - imageCount
+
+  const parent = generateWAMessageFromContent(jid, {
+    messageContextInfo: {},
+    albumMessage: {
+      expectedImageCount: imageCount,
+      expectedVideoCount: videoCount
+    }
+  }, { userJid: client.user.id })
+
+  await client.relayMessage(jid, parent.message, { messageId: parent.key.id })
+  const ids = [parent.key.id]
+
+  try {
+    for (let i = 0; i < files.length; i++) {
+      const msg = await generateWAMessage(
+        jid,
+        mediaContent(files[i], i === 0 ? caption : ""),
+        { upload: client.waUploadToServer }
+      )
+      msg.message.messageContextInfo = {
+        messageAssociation: { associationType: 1, parentMessageKey: parent.key }
+      }
+      await client.relayMessage(jid, msg.message, { messageId: msg.key.id })
+      ids.push(msg.key.id)
+      if (i < files.length - 1) await sleep(500)
+    }
+  } catch (e) {
+    e.partial = true // something already went out, don't resend
+    throw e
+  }
+  return ids
+}
+
+// One item -> one post in one group. Returns the sent message ids.
+async function sendPost(client, jid, files, caption) {
+  if (!files.length) {
+    const r = await client.sendMessage(jid, { text: caption })
+    return [r?.key?.id]
+  }
+
+  if (files.length === 1) {
+    const r = await client.sendMessage(jid, mediaContent(files[0], caption))
+    return [r?.key?.id]
+  }
+
+  try {
+    return await sendAlbumManual(client, jid, files, caption)
+  } catch (e) {
+    if (e.partial) throw e
+    console.log("marketplace album failed, falling back to separate messages:", e.message)
+  }
+
+  // Fallback: separate messages (caption on the first one only)
+  const ids = []
+  for (let i = 0; i < files.length; i++) {
+    const r = await client.sendMessage(jid, mediaContent(files[i], i === 0 ? caption : ""))
+    ids.push(r?.key?.id)
+    if (i < files.length - 1) await sleep(randomBetween(MEDIA_DELAY))
+  }
+  return ids
 }
 
 function cleanNumber(num) {
@@ -1000,16 +1125,16 @@ function getLatestProduct(listings) {
   return active[0] || null
 }
 
-// Caption used when posting. The #ID tag lets mpdelete find the item by reply.
+// Posts use the caption only. No product ID is added.
 function buildPostCaption(item) {
-  return `${item.caption ? item.caption + "\n\n" : ""}#${item.id}`
+  return item.caption || ""
 }
 
 async function cleanupInactive() {
-  await mutateListings(async (listings) => {
+  const res = await mutateListings(async (listings) => {
     const now = Date.now()
     const limit = INACTIVE_DAYS * 24 * 60 * 60 * 1000
-    let changed = false
+    const deleted = []
 
     for (const id of Object.keys(listings)) {
       const item = listings[id]
@@ -1020,12 +1145,20 @@ async function cleanupInactive() {
             fs.rmSync(dir, { recursive: true, force: true })
           }
           delete listings[id]
-          changed = true
+          deleted.push(id)
         }
       }
     }
-    return { skipSave: !changed }
+    return { skipSave: !deleted.length, deleted }
   })
+
+  if (res.deleted.length) {
+    await mutateMsgMap(async (map) => {
+      for (const k of Object.keys(map)) {
+        if (res.deleted.includes(map[k])) delete map[k]
+      }
+    })
+  }
 }
 
 // Runs on a timer instead of before every command.
@@ -1418,11 +1551,21 @@ kord({
     let id = cleanId(text)
 
     if (!id && m.quoted) {
-      // Posted captions end with "#SXXXX" / "#RXXXX". Case-sensitive on purpose,
-      // so normal words like "Samsung" are never mistaken for an ID.
-      const quotedText = m.quoted.text || m.quoted.caption || ""
-      const matches = [...quotedText.matchAll(/#([SR][A-HJ-NP-Z2-9]{4})\b/g)]
-      if (matches.length) id = matches[matches.length - 1][1]
+      // Look up the replied-to message in the sent-message map
+      const qids = [m.quoted.id, m.quoted.key?.id, m.quoted.stanzaId].filter(Boolean)
+      if (qids.length) {
+        const map = await loadMsgMap()
+        for (const q of qids) {
+          if (map[q]) { id = map[q]; break }
+        }
+      }
+
+      // Older posts (sent before IDs were removed) still carry "#SXXXX" in the caption
+      if (!id) {
+        const quotedText = m.quoted.text || m.quoted.caption || ""
+        const matches = [...quotedText.matchAll(/#([SR][A-HJ-NP-Z2-9]{4})\b/g)]
+        if (matches.length) id = matches[matches.length - 1][1]
+      }
     }
 
     if (!id) {
@@ -1760,6 +1903,7 @@ kord({
 
       let success = 0
       let fail = 0
+      let skipped = 0
       let consecutiveFails = 0
       let aborted = false
 
@@ -1786,32 +1930,17 @@ kord({
           if (files.length >= MAX_MEDIA_PER_POST) break
         }
 
+        if (!files.length && !caption) {
+          console.log(`mppost skip #${item.id}: no media and no caption`)
+          skipped++
+          continue
+        }
+
         for (let gi = 0; gi < groups.length; gi++) {
           const groupJid = groups[gi]
           try {
-            if (!files.length) {
-              await m.client.sendMessage(groupJid, { text: caption })
-            } else {
-              for (let i = 0; i < files.length; i++) {
-                const file = files[i]
-                // Every media carries the #ID so replying to any of them works with mpdelete
-                const cap = i === 0 ? caption : `#${item.id}`
-                if (file.kind === "video") {
-                  await m.client.sendMessage(groupJid, {
-                    video: file.buffer,
-                    mimetype: file.mimetype,
-                    caption: cap
-                  })
-                } else {
-                  await m.client.sendMessage(groupJid, {
-                    image: file.buffer,
-                    mimetype: file.mimetype,
-                    caption: cap
-                  })
-                }
-                if (i < files.length - 1) await sleep(randomBetween(MEDIA_DELAY))
-              }
-            }
+            const sentIds = await sendPost(m.client, groupJid, files, caption)
+            await recordSent(item.id, sentIds)
             success++
             consecutiveFails = 0
           } catch (e) {
@@ -1833,6 +1962,7 @@ kord({
       }
 
       let msg = `✓ Posting done\n_Success: ${success}_\n_Failed: ${fail}_`
+      if (skipped) msg += `\n_Skipped (nothing to send): ${skipped}_`
       if (aborted) msg += `\n\n⚠ _Stopped early after ${MAX_CONSECUTIVE_FAILS} failures in a row. Check your connection/groups and try again later._`
       if (leftover) msg += `\n\n_${leftover} item(s) not posted (max ${MAX_ITEMS_PER_RUN} per run). Run *${prefix}mppost go* again later._`
       return await m.send(msg)
