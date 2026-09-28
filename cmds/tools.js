@@ -822,6 +822,10 @@ if (!fs.existsSync(MEDIA_DIR)) {
   fs.mkdirSync(MEDIA_DIR, { recursive: true })
 }
 
+const NO_MEDIA_MSG =
+  `_No photo/video found to save._\n` +
+  `_If you replied to an album: the bot only sees albums that arrived after it started and after a marketplace command was run once (try *${prefix}mp*, then resend the album). Or reply to a single photo._`
+
 // ── Helpers ──────────────────────────────────────────────
 
 // Simple promise-queue lock: runs tasks one at a time, in order
@@ -966,6 +970,108 @@ function getBaileys() {
   return baileysLibPromise
 }
 
+// ── Album support ────────────────────────────────────────
+// When you reply to a WhatsApp album, the quoted message is only an empty "album" parent.
+// The real photos/videos arrive as separate messages linked to that parent, so we watch
+// incoming messages, remember those children, and download them when you reply to the album.
+const albumCache = new Map() // parentMessageId -> [child messages]
+const ALBUM_CACHE_MAX = 300
+const silentLogger = {
+  level: "silent",
+  info() {}, debug() {}, warn() {}, error() {}, trace() {}, fatal() {},
+  child() { return silentLogger }
+}
+
+function unwrapContent(content) {
+  if (!content) return {}
+  return content.ephemeralMessage?.message ||
+    content.viewOnceMessage?.message ||
+    content.viewOnceMessageV2?.message ||
+    content.documentWithCaptionMessage?.message ||
+    content
+}
+
+function trackAlbumChild(msg) {
+  try {
+    const content = msg?.message
+    if (!content) return
+    const inner = unwrapContent(content)
+    if (!(inner.imageMessage || inner.videoMessage)) return
+
+    const assoc = content.messageContextInfo?.messageAssociation ||
+      inner.messageContextInfo?.messageAssociation
+    const parentId = assoc?.parentMessageKey?.id
+    if (!parentId) return
+
+    const list = albumCache.get(parentId) || []
+    if (list.some(x => x.key?.id === msg.key?.id)) return
+    list.push(msg)
+    albumCache.set(parentId, list)
+
+    if (albumCache.size > ALBUM_CACHE_MAX) {
+      albumCache.delete(albumCache.keys().next().value)
+    }
+  } catch (e) {
+    console.log("marketplace album track error:", e.message)
+  }
+}
+
+// Attach once per socket. Called from marketplace commands.
+function ensureAlbumListener(client) {
+  try {
+    if (!client || !client.ev || client.__mpAlbumListener) return
+    client.__mpAlbumListener = true
+    client.ev.on("messages.upsert", ({ messages }) => {
+      for (const msg of messages || []) trackAlbumChild(msg)
+    })
+  } catch (e) {
+    console.log("marketplace album listener error:", e.message)
+  }
+}
+
+function quotedIds(m) {
+  return [
+    m.quoted?.id,
+    m.quoted?.key?.id,
+    m.quoted?.stanzaId,
+    m.msg?.contextInfo?.stanzaId,
+    m.message?.extendedTextMessage?.contextInfo?.stanzaId
+  ].filter(Boolean)
+}
+
+async function downloadAlbumChildren(client, parentIds) {
+  const lib = await getBaileys()
+  if (!lib || !lib.downloadMediaMessage) return []
+
+  for (const pid of parentIds) {
+    const children = albumCache.get(pid)
+    if (!children || !children.length) continue
+
+    const files = []
+    for (const msg of children) {
+      try {
+        const buffer = await lib.downloadMediaMessage(
+          msg,
+          "buffer",
+          {},
+          { logger: silentLogger, reuploadRequest: client.updateMediaMessage }
+        )
+        const inner = unwrapContent(msg.message)
+        const kind = inner.videoMessage ? "video" : "image"
+        const mime = (inner.videoMessage || inner.imageMessage)?.mimetype
+        if (buffer && buffer.length > 100) {
+          const ext = extFromMime(mime, kind)
+          files.push({ buffer, ext, kind, mimetype: MIME_BY_EXT[ext] })
+        }
+      } catch (e) {
+        console.log("marketplace album download error:", e.message)
+      }
+    }
+    return files
+  }
+  return []
+}
+
 function mediaContent(file, caption) {
   const content = file.kind === "video"
     ? { video: file.buffer, mimetype: file.mimetype }
@@ -1078,8 +1184,13 @@ function getFileKind(filename) {
 async function downloadMedia(m) {
   const files = []
   try {
+    ensureAlbumListener(m.client)
     if (m.quoted) {
       const q = m.quoted
+      if (!(q.image || q.video)) {
+        // Possibly a reply to an album
+        files.push(...await downloadAlbumChildren(m.client, quotedIds(m)))
+      }
       if (q.image || q.video) {
         const kind = q.video ? "video" : "image"
         const buffer = await q.download()
@@ -1204,6 +1315,7 @@ kord({
   fromMe: true,
   type: "marketplace",
 }, async (m) => {
+  ensureAlbumListener(m.client)
   const msg = `*Marketplace Commands*
 
 *Products*
@@ -1270,7 +1382,7 @@ kord({
         return await m.send(`_Reply to a photo/video with *${prefix}mpsell ${id}*_`)
       }
       const mediaFiles = await downloadMedia(m)
-      if (!mediaFiles.length) return await m.send("_No photo/video found to save_")
+      if (!mediaFiles.length) return await m.send(NO_MEDIA_MSG)
 
       const res = await mutateListings(async (listings) => {
         const item = listings[id]
@@ -1295,7 +1407,7 @@ kord({
     }
 
     const mediaFiles = await downloadMedia(m)
-    if (!mediaFiles.length) return await m.send("_No photo/video found to save_")
+    if (!mediaFiles.length) return await m.send(NO_MEDIA_MSG)
 
     let ownerNumber = cleanNumber(arg)
     if (!ownerNumber && m.quoted?.participant) ownerNumber = cleanNumber(m.quoted.participant)
@@ -1325,7 +1437,8 @@ kord({
     msg += `\n\n_Set caption:_ *${prefix}mpedit ${res.id} Your caption*`
     if (!ownerNumber) msg += `\n_Set owner:_ *${prefix}mpowner ${res.id} 234xxxxxxxxxx*`
     msg += `\n\n_Add more media with *${prefix}mpadd*_`
-    return await m.send(msg)
+    await m.send(msg)
+    return await m.send(res.id) // bare ID, easy to copy
   } catch (e) {
     console.log("mpsell error", e)
     return await m.sendErr(e)
@@ -1349,7 +1462,7 @@ kord({
     }
 
     const mediaFiles = await downloadMedia(m)
-    if (!mediaFiles.length) return await m.send("_No photo/video found to save_")
+    if (!mediaFiles.length) return await m.send(NO_MEDIA_MSG)
 
     const res = await mutateListings(async (listings) => {
       const latest = getLatestProduct(listings)
@@ -1392,7 +1505,7 @@ kord({
         return await m.send(`_Reply to a photo/video with *${prefix}mprequest ${id}*_`)
       }
       const mediaFiles = await downloadMedia(m)
-      if (!mediaFiles.length) return await m.send("_No photo/video found to save_")
+      if (!mediaFiles.length) return await m.send(NO_MEDIA_MSG)
 
       const res = await mutateListings(async (listings) => {
         const item = listings[id]
@@ -1452,7 +1565,8 @@ kord({
     if (captionText) msg += `\n_${captionText}_`
     if (res.mediaCount) msg += `\n_Media: ${res.mediaCount}_`
     if (!captionText) msg += `\n\n_Set caption:_ *${prefix}mpedit ${res.id} Looking for ...*`
-    return await m.send(msg)
+    await m.send(msg)
+    return await m.send(res.id) // bare ID, easy to copy
   } catch (e) {
     console.log("mprequest error", e)
     return await m.sendErr(e)
@@ -1617,6 +1731,7 @@ kord({
   type: "marketplace",
 }, async (m, text) => {
   try {
+    ensureAlbumListener(m.client)
     const filter = (text || "").trim().toLowerCase()
     const listings = await loadListings()
     const items = Object.values(listings).filter(i => i.status === "active")
