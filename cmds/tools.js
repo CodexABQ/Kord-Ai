@@ -787,10 +787,11 @@ kord({
 
 
 
- /*
+/*
  * Marketplace system for Kord-Ai (fixed version)
  * Paste at the bottom of an existing cmds file
  */
+
 
 const MEDIA_DIR = path.join(__dirname, "..", "media", "marketplace")
 const DATA_KEY = "marketplace_listings"
@@ -943,10 +944,26 @@ async function recordSent(itemId, ids) {
   }
 }
 
-// Load whichever baileys package the bot uses (needed to build real WhatsApp albums)
-let baileysLib = null
-for (const name of ["baileys", "@whiskeysockets/baileys", "@adiwajshing/baileys"]) {
-  try { baileysLib = require(name); break } catch {}
+// Load the baileys package. baileys v7 is ESM-only, so require() can fail; use dynamic import().
+let baileysLibPromise = null
+function getBaileys() {
+  if (!baileysLibPromise) {
+    baileysLibPromise = (async () => {
+      let lastErr = null
+      for (const name of ["baileys", "@whiskeysockets/baileys", "@adiwajshing/baileys"]) {
+        try {
+          const mod = await import(name)
+          if (mod.generateWAMessageFromContent) return mod
+          if (mod.default && mod.default.generateWAMessageFromContent) return mod.default
+        } catch (e) {
+          lastErr = e
+        }
+      }
+      console.log("marketplace: could not load baileys:", lastErr ? lastErr.message : "no exports found")
+      return null
+    })()
+  }
+  return baileysLibPromise
 }
 
 function mediaContent(file, caption) {
@@ -959,10 +976,11 @@ function mediaContent(file, caption) {
 
 // Sends all media as ONE album message with a single caption
 async function sendAlbumManual(client, jid, files, caption) {
-  if (!baileysLib || !baileysLib.generateWAMessageFromContent || !baileysLib.generateWAMessage) {
+  const lib = await getBaileys()
+  if (!lib || !lib.generateWAMessageFromContent || !lib.generateWAMessage) {
     throw new Error("baileys helpers not found")
   }
-  const { generateWAMessageFromContent, generateWAMessage } = baileysLib
+  const { generateWAMessageFromContent, generateWAMessage } = lib
 
   const imageCount = files.filter(f => f.kind === "image").length
   const videoCount = files.length - imageCount
