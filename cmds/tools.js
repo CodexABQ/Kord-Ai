@@ -808,6 +808,8 @@ const MEDIA_DELAY = [2500, 4500]      // ms between media in the same post
 const GROUP_DELAY = [8000, 15000]     // ms between groups
 const ITEM_DELAY = [15000, 30000]     // ms between items
 const MAX_CONSECUTIVE_FAILS = 3       // abort the run after this many failures in a row
+const REQUEST_REPEAT_COUNT = 3        // plain-text requests are sent this many times in a row per group
+const REQUEST_REPEAT_DELAY = [1500, 3000] // ms between repeats
 
 const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
 const MIME_BY_EXT = {
@@ -1155,6 +1157,22 @@ async function sendPost(client, jid, files, caption) {
 function cleanNumber(num) {
   if (!num) return ""
   return String(num).replace(/\D/g, "")
+}
+
+// In a group, react instead of posting the full result publicly, and DM the owner the details.
+// In a DM (owner chatting with the bot directly), just reply normally.
+async function replyDiscreet(m, fullText, emoji = "✅") {
+  const isGroup = m.chat.endsWith("@g.us")
+  if (!isGroup) {
+    return await m.send(fullText)
+  }
+  const ownerJid = m.ownerJid || m.sender
+  try {
+    await m.client.sendMessage(m.chat, { react: { text: emoji, key: m.key } })
+  } catch {}
+  try {
+    await m.client.sendMessage(ownerJid, { text: fullText })
+  } catch {}
 }
 
 function cleanId(text) {
@@ -1664,8 +1682,8 @@ kord({
       return { ok: true }
     })
 
-    if (res.missing) return await m.send(`_No item found with ID *#${id}*_`)
-    return await m.send(`✓ *#${id}* marked inactive\n_Auto-deleted after ${INACTIVE_DAYS} days_`)
+    if (res.missing) return await replyDiscreet(m, `_No item found with ID *#${id}*_`, "⚠️")
+    return await replyDiscreet(m, `✓ *#${id}* marked inactive\n_Auto-deleted after ${INACTIVE_DAYS} days_`)
   } catch (e) {
     console.log("mpremove error", e)
     return await m.sendErr(e)
@@ -1715,8 +1733,8 @@ kord({
       return { ok: true }
     })
 
-    if (res.missing) return await m.send(`_No item found with ID *#${id}*_`)
-    return await m.send(`✓ *#${id}* removed\n_Will be auto-deleted after ${INACTIVE_DAYS} days_`)
+    if (res.missing) return await replyDiscreet(m, `_No item found with ID *#${id}*_`, "⚠️")
+    return await replyDiscreet(m, `✓ *#${id}* removed\n_Will be auto-deleted after ${INACTIVE_DAYS} days_`)
   } catch (e) {
     console.log("mpdelete error", e)
     return await m.sendErr(e)
@@ -2069,11 +2087,24 @@ kord({
           continue
         }
 
+        const isPlainTextRequest = item.type === "request" && !files.length && !!caption
+
         for (let gi = 0; gi < groups.length; gi++) {
           const groupJid = groups[gi]
           try {
-            const sentIds = await sendPost(m.client, groupJid, files, caption)
-            await recordSent(item.id, sentIds)
+            if (isPlainTextRequest) {
+              // Plain-text requests are easy to scroll past, so send it a few times in a row
+              const sentIds = []
+              for (let r = 0; r < REQUEST_REPEAT_COUNT; r++) {
+                const res = await m.client.sendMessage(groupJid, { text: caption })
+                sentIds.push(res?.key?.id)
+                if (r < REQUEST_REPEAT_COUNT - 1) await sleep(randomBetween(REQUEST_REPEAT_DELAY))
+              }
+              await recordSent(item.id, sentIds)
+            } else {
+              const sentIds = await sendPost(m.client, groupJid, files, caption)
+              await recordSent(item.id, sentIds)
+            }
             success++
             consecutiveFails = 0
           } catch (e) {
