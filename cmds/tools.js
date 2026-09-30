@@ -787,7 +787,7 @@ kord({
 
 
 
-/*
+ /*
  * Marketplace system for Kord-Ai (fixed version)
  * Paste at the bottom of an existing cmds file
  */
@@ -822,6 +822,85 @@ const MIME_BY_EXT = {
 
 if (!fs.existsSync(MEDIA_DIR)) {
   fs.mkdirSync(MEDIA_DIR, { recursive: true })
+}
+
+// ── Optional MongoDB persistence ─────────────────────────
+// Product photos/videos stay on local disk exactly as before (nothing below
+// touches that). Only the lightweight JSON records — listings, groups, and
+// the reply->product message map — move here when MONGODB_URI is set, so a
+// bot restart or redeploy doesn't wipe them. Without MONGODB_URI, or if the
+// connection fails, everything falls back to the bot's normal local storage
+// automatically, so nothing breaks for people who don't set it up.
+let mongoose = null
+try { mongoose = require("mongoose") } catch {}
+
+const MP_MONGO_RETRY_MS = 5 * 60 * 1000 // don't hammer a broken URI more than once per 5 min
+let mpMongo = { model: null, connecting: null, failed: false, failedAt: 0, uri: null }
+
+async function getMpMongoModel() {
+  if (!mongoose) return null
+  const uri = config().MONGODB_URI
+  if (!uri) return null
+
+  // Reconnect if the configured URI changed since we last connected (e.g. via setvar)
+  if (mpMongo.uri && mpMongo.uri !== uri) {
+    mpMongo = { model: null, connecting: null, failed: false, failedAt: 0, uri: null }
+  }
+
+  if (mpMongo.model) return mpMongo.model
+  if (mpMongo.failed && Date.now() - mpMongo.failedAt < MP_MONGO_RETRY_MS) return null
+  mpMongo.failed = false
+
+  if (!mpMongo.connecting) {
+    mpMongo.uri = uri
+    mpMongo.connecting = (async () => {
+      const conn = mongoose.createConnection(uri, { serverSelectionTimeoutMS: 8000 })
+      await conn.asPromise()
+      const schema = new mongoose.Schema({
+        key: { type: String, required: true, unique: true, index: true },
+        value: mongoose.Schema.Types.Mixed
+      }, { collection: "marketplace_kv", timestamps: true })
+      mpMongo.model = conn.model("MarketplaceKV", schema)
+      console.log("marketplace: connected to MongoDB for persistent storage")
+      return mpMongo.model
+    })().catch((e) => {
+      console.log("marketplace: MongoDB connection failed, using local storage instead:", e.message)
+      mpMongo.failed = true
+      mpMongo.failedAt = Date.now()
+      mpMongo.connecting = null
+      return null
+    })
+  }
+  return mpMongo.connecting
+}
+
+// Drop-in replacements for the bot's built-in getData/storeData, used only by marketplace
+// data. Same contract as the originals (value is a JSON string) so nothing else about the
+// listings/groups/msgmap code below needs to change.
+async function mpGetData(key) {
+  const Model = await getMpMongoModel()
+  if (Model) {
+    try {
+      const doc = await Model.findOne({ key }).lean()
+      return doc ? doc.value : null
+    } catch (e) {
+      console.log("marketplace: MongoDB read failed, falling back to local storage:", e.message)
+    }
+  }
+  return await getData(key)
+}
+
+async function mpStoreData(key, value) {
+  const Model = await getMpMongoModel()
+  if (Model) {
+    try {
+      await Model.updateOne({ key }, { $set: { value } }, { upsert: true })
+      return
+    } catch (e) {
+      console.log("marketplace: MongoDB write failed, falling back to local storage:", e.message)
+    }
+  }
+  return await storeData(key, value)
 }
 
 const NO_MEDIA_MSG =
@@ -862,7 +941,7 @@ function generateId(type) {
 }
 
 async function loadListings() {
-  let data = await getData(DATA_KEY)
+  let data = await mpGetData(DATA_KEY)
   if (!data) return {}
   if (typeof data === "string") {
     try { return JSON.parse(data) } catch { return {} }
@@ -871,11 +950,11 @@ async function loadListings() {
 }
 
 async function saveListings(listings) {
-  await storeData(DATA_KEY, JSON.stringify(listings, null, 2))
+  await mpStoreData(DATA_KEY, JSON.stringify(listings, null, 2))
 }
 
 async function loadGroups() {
-  let data = await getData(GROUPS_KEY)
+  let data = await mpGetData(GROUPS_KEY)
   if (!data) return []
   if (typeof data === "string") {
     try { return JSON.parse(data) } catch { return [] }
@@ -884,7 +963,7 @@ async function loadGroups() {
 }
 
 async function saveGroups(groups) {
-  await storeData(GROUPS_KEY, JSON.stringify(groups, null, 2))
+  await mpStoreData(GROUPS_KEY, JSON.stringify(groups, null, 2))
 }
 
 /*
@@ -913,7 +992,7 @@ function mutateGroups(mutator) {
 }
 
 async function loadMsgMap() {
-  let data = await getData(MSGMAP_KEY)
+  let data = await mpGetData(MSGMAP_KEY)
   if (!data) return {}
   if (typeof data === "string") {
     try { return JSON.parse(data) } catch { return {} }
@@ -922,7 +1001,7 @@ async function loadMsgMap() {
 }
 
 async function saveMsgMap(map) {
-  await storeData(MSGMAP_KEY, JSON.stringify(map))
+  await mpStoreData(MSGMAP_KEY, JSON.stringify(map))
 }
 
 function mutateMsgMap(mutator) {
@@ -1232,12 +1311,50 @@ async function downloadMedia(m) {
   return files
 }
 
+// ── Optional Cloudinary persistence for the actual photos/videos ────
+// Render's free tier wipes local disk on every restart/redeploy, so on its own
+// MEDIA_DIR does not survive. When CLOUDINARY_CLOUD_NAME and
+// CLOUDINARY_UPLOAD_PRESET are set (see setup notes), every file saved below is
+// also uploaded to Cloudinary's free tier, and the returned URL is stored on the
+// listing itself (which already persists via Mongo/local storage above). After a
+// restart, resolveItemMedia() downloads from that URL to rebuild the local copy.
+// Without those two env vars, this section does nothing and disk works as before.
+let axiosLib = null
+try { axiosLib = require("axios") } catch {}
+let FormDataLib = null
+try { FormDataLib = require("form-data") } catch {}
+
+function cloudUploadEnabled() {
+  return !!(axiosLib && FormDataLib && process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_UPLOAD_PRESET)
+}
+
+async function uploadToCloudinary(buffer, kind, ext) {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME
+  const preset = process.env.CLOUDINARY_UPLOAD_PRESET
+  const resourceType = kind === "video" ? "video" : "image"
+  const endpoint = `https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`
+
+  const form = new FormDataLib()
+  form.append("file", buffer, { filename: `mp_${Date.now()}${ext}` })
+  form.append("upload_preset", preset)
+  form.append("folder", "marketplace")
+
+  const res = await axiosLib.post(endpoint, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+    timeout: 30000
+  })
+  return { url: res.data.secure_url, publicId: res.data.public_id }
+}
+
 async function saveMediaFiles(id, mediaFiles) {
   const dir = path.join(MEDIA_DIR, id)
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 
   const saved = []
   const existing = fs.readdirSync(dir).filter(f => !f.startsWith(".")).length
+  const cloudOn = cloudUploadEnabled()
 
   for (let i = 0; i < mediaFiles.length; i++) {
     const f = mediaFiles[i]
@@ -1246,12 +1363,28 @@ async function saveMediaFiles(id, mediaFiles) {
     const filename = `${Date.now()}_${existing + i + 1}${f.ext}`
     const filepath = path.join(dir, filename)
     fs.writeFileSync(filepath, f.buffer)
-    saved.push({
+
+    const entry = {
       path: filepath,
       filename,
       mimetype: f.mimetype,
-      ext: f.ext
-    })
+      ext: f.ext,
+      kind: f.kind,
+      url: null,
+      publicId: null
+    }
+
+    if (cloudOn) {
+      try {
+        const up = await uploadToCloudinary(f.buffer, f.kind, f.ext)
+        entry.url = up.url
+        entry.publicId = up.publicId
+      } catch (e) {
+        console.log("marketplace cloud upload failed (kept locally only):", e.response?.data?.error?.message || e.message)
+      }
+    }
+
+    saved.push(entry)
   }
   return saved
 }
@@ -1263,6 +1396,79 @@ function getMediaList(id) {
     .filter(f => !f.startsWith("."))
     .sort()
     .map(f => ({ path: path.join(dir, f), filename: f }))
+}
+
+// Builds the list of {buffer, kind, mimetype} for an item, preferring the local
+// disk cache and falling back to Cloudinary (via item.media) if the disk copy is
+// gone — which is what makes media survive a Render restart.
+async function resolveItemMedia(item) {
+  const result = []
+  const id = item.id
+
+  if (Array.isArray(item.media) && item.media.length) {
+    for (const entry of item.media) {
+      if (result.length >= MAX_MEDIA_PER_POST) break
+      try {
+        let buffer = null
+        if (entry.filename) {
+          const localPath = path.join(MEDIA_DIR, id, entry.filename)
+          if (fs.existsSync(localPath)) {
+            try { buffer = fs.readFileSync(localPath) } catch {}
+          }
+        }
+        if ((!buffer || buffer.length < 100) && entry.url && axiosLib) {
+          const resp = await axiosLib.get(entry.url, { responseType: "arraybuffer", timeout: 20000 })
+          buffer = Buffer.from(resp.data)
+          try {
+            const dir = path.join(MEDIA_DIR, id)
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+            if (entry.filename) fs.writeFileSync(path.join(dir, entry.filename), buffer)
+          } catch {}
+        }
+        if (buffer && buffer.length > 100) {
+          result.push({ buffer, kind: entry.kind, mimetype: entry.mimetype })
+        }
+      } catch (e) {
+        console.log("marketplace media resolve error:", e.message)
+      }
+    }
+    return result
+  }
+
+  // Items saved before this update (or with cloud upload off): disk only, as before
+  for (const f of getMediaList(id)) {
+    if (result.length >= MAX_MEDIA_PER_POST) break
+    const kind = getFileKind(f.filename)
+    if (!kind) continue
+    try {
+      const buffer = fs.readFileSync(f.path)
+      if (buffer && buffer.length > 100) {
+        result.push({ buffer, kind, mimetype: MIME_BY_EXT[path.extname(f.filename).toLowerCase()] })
+      }
+    } catch (e) {
+      console.log("marketplace media read error:", e.message)
+    }
+  }
+  return result
+}
+
+// Records newly saved files on the listing itself, so resolveItemMedia can find them
+// again after a restart. Returns how many of them have no cloud URL (i.e. will be
+// lost if the disk gets wiped), so callers can warn the user.
+function attachMediaEntries(item, saved) {
+  if (!Array.isArray(item.media)) item.media = []
+  let missingCloud = 0
+  for (const s of saved) {
+    item.media.push({
+      filename: s.filename,
+      kind: s.kind,
+      mimetype: s.mimetype,
+      url: s.url || null,
+      publicId: s.publicId || null
+    })
+    if (cloudUploadEnabled() && !s.url) missingCloud++
+  }
+  return missingCloud
 }
 
 function getLatestProduct(listings) {
@@ -1406,13 +1612,16 @@ kord({
         const item = listings[id]
         if (!item) return { missing: true, skipSave: true }
         const saved = await saveMediaFiles(id, mediaFiles)
+        const missingCloud = attachMediaEntries(item, saved)
         item.mediaCount = (item.mediaCount || 0) + saved.length
         item.updatedAt = Date.now()
-        return { count: saved.length, total: item.mediaCount }
+        return { count: saved.length, total: item.mediaCount, missingCloud }
       })
 
       if (res.missing) return await m.send(`_No item found with ID *#${id}*_`)
-      return await m.send(`✓ Added *${res.count}* media to *#${id}*\n_Total media: ${res.total}_`)
+      let addMsg = `✓ Added *${res.count}* media to *#${id}*\n_Total media: ${res.total}_`
+      if (res.missingCloud) addMsg += `\n⚠ _${res.missingCloud} file(s) only saved locally — cloud upload failed, they may be lost on restart_`
+      return await m.send(addMsg)
     }
 
     // Create a new product
@@ -1436,18 +1645,21 @@ kord({
       while (listings[id]) id = generateId("sell")
 
       const saved = await saveMediaFiles(id, mediaFiles)
-      listings[id] = {
+      const item = {
         id,
         type: "sell",
         caption: "",
         ownerNumber: ownerNumber || "",
         mediaCount: saved.length,
+        media: [],
         status: "active",
         createdAt: Date.now(),
         updatedAt: Date.now(),
         inactiveAt: null
       }
-      return { id, count: saved.length }
+      const missingCloud = attachMediaEntries(item, saved)
+      listings[id] = item
+      return { id, count: saved.length, missingCloud }
     })
 
     let msg = `✓ Product added\n\n*ID:* ${res.id}\n_Media: ${res.count}_`
@@ -1455,6 +1667,7 @@ kord({
     msg += `\n\n_Set caption:_ *${prefix}mpedit ${res.id} Your caption*`
     if (!ownerNumber) msg += `\n_Set owner:_ *${prefix}mpowner ${res.id} 234xxxxxxxxxx*`
     msg += `\n\n_Add more media with *${prefix}mpadd*_`
+    if (res.missingCloud) msg += `\n⚠ _${res.missingCloud} file(s) only saved locally — cloud upload failed, they may be lost on restart_`
     await m.send(msg)
     return await m.send(res.id) // bare ID, easy to copy
   } catch (e) {
@@ -1486,15 +1699,18 @@ kord({
       const latest = getLatestProduct(listings)
       if (!latest) return { none: true, skipSave: true }
       const saved = await saveMediaFiles(latest.id, mediaFiles)
+      const missingCloud = attachMediaEntries(latest, saved)
       latest.mediaCount = (latest.mediaCount || 0) + saved.length
       latest.updatedAt = Date.now()
-      return { id: latest.id, count: saved.length, total: latest.mediaCount }
+      return { id: latest.id, count: saved.length, total: latest.mediaCount, missingCloud }
     })
 
     if (res.none) {
       return await m.send(`_No active product found._\n_Create one with *${prefix}mpsell*_`)
     }
-    return await m.send(`✓ Added *${res.count}* media to *#${res.id}*\n_Total media: ${res.total}_`)
+    let addMsg = `✓ Added *${res.count}* media to *#${res.id}*\n_Total media: ${res.total}_`
+    if (res.missingCloud) addMsg += `\n⚠ _${res.missingCloud} file(s) only saved locally — cloud upload failed, they may be lost on restart_`
+    return await m.send(addMsg)
   } catch (e) {
     console.log("mpadd error", e)
     return await m.sendErr(e)
@@ -1529,13 +1745,16 @@ kord({
         const item = listings[id]
         if (!item) return { missing: true, skipSave: true }
         const saved = await saveMediaFiles(id, mediaFiles)
+        const missingCloud = attachMediaEntries(item, saved)
         item.mediaCount = (item.mediaCount || 0) + saved.length
         item.updatedAt = Date.now()
-        return { count: saved.length, total: item.mediaCount }
+        return { count: saved.length, total: item.mediaCount, missingCloud }
       })
 
       if (res.missing) return await m.send(`_No item found with ID *#${id}*_`)
-      return await m.send(`✓ Added *${res.count}* media to request *#${id}*\n_Total: ${res.total}_`)
+      let addMsg = `✓ Added *${res.count}* media to request *#${id}*\n_Total: ${res.total}_`
+      if (res.missingCloud) addMsg += `\n⚠ _${res.missingCloud} file(s) only saved locally — cloud upload failed, they may be lost on restart_`
+      return await m.send(addMsg)
     }
 
     // Create a new request
@@ -1559,30 +1778,35 @@ kord({
       let id = generateId("request")
       while (listings[id]) id = generateId("request")
 
-      let mediaCount = 0
-      if (mediaFiles.length) {
-        const saved = await saveMediaFiles(id, mediaFiles)
-        mediaCount = saved.length
-      }
-
-      listings[id] = {
+      const item = {
         id,
         type: "request",
         caption: captionText || "",
         ownerNumber: ownerNumber || "",
-        mediaCount,
+        mediaCount: 0,
+        media: [],
         status: "active",
         createdAt: Date.now(),
         updatedAt: Date.now(),
         inactiveAt: null
       }
-      return { id, mediaCount }
+
+      let missingCloud = 0
+      if (mediaFiles.length) {
+        const saved = await saveMediaFiles(id, mediaFiles)
+        missingCloud = attachMediaEntries(item, saved)
+        item.mediaCount = saved.length
+      }
+
+      listings[id] = item
+      return { id, mediaCount: item.mediaCount, missingCloud }
     })
 
     let msg = `✓ Request added\n\n*ID:* ${res.id}`
     if (captionText) msg += `\n_${captionText}_`
     if (res.mediaCount) msg += `\n_Media: ${res.mediaCount}_`
     if (!captionText) msg += `\n\n_Set caption:_ *${prefix}mpedit ${res.id} Looking for ...*`
+    if (res.missingCloud) msg += `\n⚠ _${res.missingCloud} file(s) only saved locally — cloud upload failed, they may be lost on restart_`
     await m.send(msg)
     return await m.send(res.id) // bare ID, easy to copy
   } catch (e) {
@@ -1818,15 +2042,10 @@ kord({
 
     await m.send(msg)
 
-    const media = getMediaList(id)
-    for (const file of media) {
+    const files = await resolveItemMedia(item)
+    for (const file of files) {
       try {
-        const kind = getFileKind(file.filename)
-        if (!kind) continue
-        const buffer = fs.readFileSync(file.path)
-        if (!buffer || buffer.length < 100) continue
-        const mimetype = MIME_BY_EXT[path.extname(file.filename).toLowerCase()]
-        await m.send(buffer, { caption: `#${id}`, mimetype }, kind)
+        await m.send(file.buffer, { caption: `#${id}`, mimetype: file.mimetype }, file.kind)
       } catch (e) {
         console.log("mpview media error", e.message)
       }
@@ -2062,24 +2281,9 @@ kord({
         const item = toPost[ii]
         const caption = buildPostCaption(item)
 
-        // Read each media file once per item (not once per group)
-        const files = []
-        for (const f of getMediaList(item.id)) {
-          const kind = getFileKind(f.filename)
-          if (!kind) continue
-          try {
-            const buffer = fs.readFileSync(f.path)
-            if (!buffer || buffer.length < 100) continue
-            files.push({
-              buffer,
-              kind,
-              mimetype: MIME_BY_EXT[path.extname(f.filename).toLowerCase()]
-            })
-          } catch (e) {
-            console.log("mppost read error", e.message)
-          }
-          if (files.length >= MAX_MEDIA_PER_POST) break
-        }
+        // Read each media file once per item (not once per group). Falls back to
+        // Cloudinary automatically if the local disk copy is gone (e.g. after a restart).
+        const files = await resolveItemMedia(item)
 
         if (!files.length && !caption) {
           console.log(`mppost skip #${item.id}: no media and no caption`)
