@@ -786,8 +786,8 @@ kord({
 
 
 
-
- /*
+ 
+/*
  * Marketplace system for Kord-Ai (fixed version)
  * Paste at the bottom of an existing cmds file
  */
@@ -1567,6 +1567,8 @@ kord({
 *Groups*
 • *${prefix}mpgadd* — add current group (silent)
 • *${prefix}mpgremove* — remove current group (silent)
+• *${prefix}mpgroup add JID1 JID2 ...* — add by JID(s), no need to join the group
+• *${prefix}mpgroup remove JID1 JID2 ...* — remove by JID(s)
 • *${prefix}mpgroup list*
 • *${prefix}mpgroup clear*
 
@@ -2132,6 +2134,66 @@ async function handleGroupRemove(m) {
   await notifyOwner(`✓ Group removed\n\`${m.chat}\`\n\nTotal: ${res.total}`)
 }
 
+// Pulls group JIDs out of free text — space, comma, or newline separated,
+// so you can paste a whole list at once. Anything not ending in @g.us is dropped.
+function extractJids(text) {
+  return (text || "")
+    .split(/[\s,]+/)
+    .map(s => s.trim())
+    .filter(Boolean)
+    .filter(s => s.endsWith("@g.us"))
+}
+
+// Add one or more groups by JID directly — no need to be inside the group.
+// Usage: mpgroup add 1203xxxxxxxxx@g.us 1203yyyyyyyyy@g.us (or one per line)
+async function handleGroupAddByJid(m, text) {
+  const jids = [...new Set(extractJids(text))]
+  if (!jids.length) {
+    return await m.send(
+      `_No valid group JIDs found._\n` +
+      `_A group JID looks like *1203xxxxxxxxx@g.us*_\n` +
+      `_Usage: *${prefix}mpgroup add JID1 JID2 ...* (one per line also works)_`
+    )
+  }
+
+  const res = await mutateGroups(async (groups) => {
+    const added = []
+    const already = []
+    for (const jid of jids) {
+      if (groups.includes(jid)) { already.push(jid); continue }
+      groups.push(jid)
+      added.push(jid)
+    }
+    return { skipSave: !added.length, added, already, total: groups.length }
+  })
+
+  let msg = `✓ Added *${res.added.length}* group(s) by JID\n_Total groups: ${res.total}_`
+  if (res.already.length) msg += `\n_Already saved: ${res.already.length}_`
+  return await m.send(msg)
+}
+
+// Remove one or more groups by JID directly. Same input format as add.
+async function handleGroupRemoveByJid(m, text) {
+  const jids = [...new Set(extractJids(text))]
+  if (!jids.length) {
+    return await m.send(
+      `_No valid group JIDs found._\n` +
+      `_Usage: *${prefix}mpgroup remove JID1 JID2 ...* (one per line also works)_`
+    )
+  }
+
+  const res = await mutateGroups(async (groups) => {
+    let removedCount = 0
+    for (const jid of jids) {
+      const idx = groups.indexOf(jid)
+      if (idx !== -1) { groups.splice(idx, 1); removedCount++ }
+    }
+    return { skipSave: !removedCount, removedCount, total: groups.length }
+  })
+
+  return await m.send(`✓ Removed *${res.removedCount}* group(s) by JID\n_Total groups: ${res.total}_`)
+}
+
 // MPGADD (for sticker)
 kord({
   cmd: "mpgadd",
@@ -2170,10 +2232,14 @@ kord({
   type: "marketplace",
 }, async (m, text) => {
   try {
-    const arg = (text || "").trim().toLowerCase()
+    const rawArg = (text || "").trim()
+    const arg = rawArg.toLowerCase()
 
     if (arg === "add") return await handleGroupAdd(m)
+    if (arg.startsWith("add ")) return await handleGroupAddByJid(m, rawArg.slice(4))
+
     if (arg === "remove") return await handleGroupRemove(m)
+    if (arg.startsWith("remove ")) return await handleGroupRemoveByJid(m, rawArg.slice(7))
 
     if (arg === "list" || !arg) {
       const groups = await loadGroups()
@@ -2198,7 +2264,9 @@ kord({
     return await m.send(
       `*mpgroup* usage:\n` +
       `• *${prefix}mpgadd* / *${prefix}mpgroup add*\n` +
+      `• *${prefix}mpgroup add JID1 JID2 ...* — add by JID, no need to be in the group\n` +
       `• *${prefix}mpgremove* / *${prefix}mpgroup remove*\n` +
+      `• *${prefix}mpgroup remove JID1 JID2 ...* — remove by JID\n` +
       `• *${prefix}mpgroup list*\n` +
       `• *${prefix}mpgroup clear*`
     )
