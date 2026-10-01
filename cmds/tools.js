@@ -1029,9 +1029,12 @@ async function recordSent(itemId, ids) {
   }
 }
 
-// Load the baileys package. baileys v7 is ESM-only, so require() can fail; use dynamic import().
+// Reuses the bot's own Baileys loader (same one .gcstatus etc. use — it shares the
+// cached import across the whole bot) when available. Falls back to loading baileys
+// directly if core doesn't export it, so this still works on older setups.
 let baileysLibPromise = null
 function getBaileys() {
+  if (typeof Baileys === "function") return Baileys()
   if (!baileysLibPromise) {
     baileysLibPromise = (async () => {
       let lastErr = null
@@ -1576,6 +1579,15 @@ kord({
 • *${prefix}mppost* — preview
 • *${prefix}mppost go* — post all
 • *${prefix}mppost go ID* — post one item
+• *${prefix}mppost go to JID/link* — post to one group only
+• *${prefix}mppost cancel* / *${prefix}mpcancel* — stop a run in progress
+
+*Broadcast*
+• *${prefix}mpbroadcast text* — one message, no media
+• *${prefix}mpbroadcast ID* — broadcast an existing listing
+• _reply to media with *${prefix}mpbroadcast caption*_
+• sends as a normal message AND to the group's status
+• add *" to JID/link"* to target one group only
 
 *Stickers tip*
 .setcmd mpsell
@@ -2144,6 +2156,89 @@ function extractJids(text) {
     .filter(s => s.endsWith("@g.us"))
 }
 
+// Lets mppost/mpbroadcast target specific group(s) instead of every saved group, by
+// appending " to <jid-or-link>[, <jid-or-link>...]" to the command. Resolves invite
+// links (https://chat.whatsapp.com/XXXX) to a JID via groupGetInviteInfo — the bot
+// does NOT need to already be a member just to resolve the link, but sending will
+// still fail if it isn't actually in that group.
+// Returns { text: <command text with the "to ..." clause removed>, groups: <JIDs> | null }.
+// null groups means no valid target was found, so the caller should fall back to the
+// saved groups list — this also means an ordinary caption that happens to contain the
+// word "to" (e.g. "free delivery to Lagos") is left alone, since it won't resolve to
+// any JID or invite link.
+async function extractTargetClause(client, text) {
+  const raw = text || ""
+  const match = raw.match(/\bto\s+(.+)$/i)
+  if (!match) return { text: raw, groups: null }
+
+  const pieces = match[1].trim().split(/[\s,]+/).map(s => s.trim()).filter(Boolean)
+  const resolved = []
+
+  for (const piece of pieces) {
+    if (piece.endsWith("@g.us")) {
+      resolved.push(piece)
+      continue
+    }
+    const linkMatch = piece.match(/chat\.whatsapp\.com\/([A-Za-z0-9]+)/i)
+    if (linkMatch) {
+      try {
+        const info = await client.groupGetInviteInfo(linkMatch[1])
+        const jid = info?.id || info?.jid
+        if (jid) resolved.push(jid)
+      } catch (e) {
+        console.log("marketplace invite resolve error:", e.message)
+      }
+    }
+  }
+
+  if (!resolved.length) return { text: raw, groups: null }
+
+  return { text: raw.slice(0, match.index).trim(), groups: [...new Set(resolved)] }
+}
+
+// Posts to a group's own Status tab — the same WhatsApp "group status" feature this
+// bot's .gcstatus command uses. Only the first media file is used, since a status
+// update only carries one.
+async function sendGroupStatus(client, groupJid, { files, caption }) {
+  const lib = await getBaileys()
+  if (!lib || !lib.generateWAMessageFromContent || !lib.proto) {
+    throw new Error("baileys helpers not found")
+  }
+  const { generateWAMessageFromContent, proto, prepareWAMessageMedia } = lib
+
+  let messagePayload
+  const file = files && files[0]
+
+  if (file) {
+    if (!prepareWAMessageMedia) throw new Error("prepareWAMessageMedia not found")
+    const mediaOptions = file.kind === "video"
+      ? { video: file.buffer, caption: caption || "" }
+      : { image: file.buffer, caption: caption || "" }
+    const prepared = await prepareWAMessageMedia(mediaOptions, { upload: client.waUploadToServer })
+    const mediaMessage = file.kind === "video"
+      ? { videoMessage: prepared.videoMessage }
+      : { imageMessage: prepared.imageMessage }
+    messagePayload = { groupStatusMessageV2: { message: mediaMessage } }
+  } else {
+    const randomHex = Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0")
+    const bgColor = 0xff000000 + parseInt(randomHex, 16)
+    messagePayload = {
+      groupStatusMessageV2: {
+        message: {
+          extendedTextMessage: { text: caption || "", backgroundArgb: bgColor, font: 2 }
+        }
+      }
+    }
+  }
+
+  const msg = generateWAMessageFromContent(
+    groupJid,
+    proto.Message.fromObject(messagePayload),
+    { userJid: client.user.id }
+  )
+  await client.relayMessage(groupJid, msg.message, { messageId: msg.key.id })
+}
+
 // Add one or more groups by JID directly — no need to be inside the group.
 // Usage: mpgroup add 1203xxxxxxxxx@g.us 1203yyyyyyyyy@g.us (or one per line)
 async function handleGroupAddByJid(m, text) {
@@ -2278,27 +2373,39 @@ kord({
 
 // MPPOST
 let mpPosting = false
+let mpCancelRequested = false
 
 kord({
   cmd: "mppost",
-  desc: "Post items to saved groups",
+  desc: "Post items to saved (or targeted) groups",
   fromMe: true,
   type: "marketplace",
 }, async (m, text) => {
   try {
+    const { text: cleanedText, groups: targetGroups } = await extractTargetClause(m.client, text || "")
+    const arg = cleanedText.trim().toLowerCase()
+
+    if (arg === "cancel" || arg === "stop") {
+      if (!mpPosting) return await m.send("_No posting run in progress_")
+      mpCancelRequested = true
+      return await m.send("_Cancelling after the current send finishes..._")
+    }
+
     const listings = await loadListings()
-    const groups = await loadGroups()
+    const groups = targetGroups || await loadGroups()
     const active = Object.values(listings).filter(i => i.status === "active")
 
     if (!active.length) return await m.send("_No active items to post_")
-    if (!groups.length) return await m.send("_No groups saved. Use *mpgadd* first_")
-
-    const arg = (text || "").trim().toLowerCase()
+    if (!groups.length) {
+      return await m.send(targetGroups
+        ? "_Couldn't resolve a group from that JID/link_"
+        : "_No groups saved. Use *mpgadd* first_")
+    }
 
     if (!arg || arg === "preview") {
       let msg = `*Ready to post*\n\n`
       msg += `Active items: *${active.length}*\n`
-      msg += `Groups: *${groups.length}*\n\n`
+      msg += `Groups: *${groups.length}*${targetGroups ? " (targeted)" : ""}\n\n`
       msg += `Items:\n`
       for (const item of active.slice(0, 15)) {
         const t = item.type === "sell" ? "S" : "R"
@@ -2308,7 +2415,9 @@ kord({
       if (active.length > 15) msg += `... +${active.length - 15} more\n`
       msg += `\n_Max ${MAX_ITEMS_PER_RUN} items per run_\n`
       msg += `_Reply *${prefix}mppost go* to post all_\n`
-      msg += `_Or *${prefix}mppost go SUSYY* for one item_`
+      msg += `_Or *${prefix}mppost go SUSYY* for one item_\n`
+      msg += `_Add " to JID/link" to post to one group only, e.g. *${prefix}mppost go to 1203xxx@g.us*_\n`
+      msg += `_*${prefix}mppost cancel* stops a run in progress_`
       return await m.send(msg)
     }
 
@@ -2326,7 +2435,7 @@ kord({
     }
 
     if (mpPosting) {
-      return await m.send("_A posting run is already in progress. Wait for it to finish._")
+      return await m.send("_A posting run is already in progress. Wait for it to finish, or use *mppost cancel*._")
     }
 
     let leftover = 0
@@ -2336,6 +2445,7 @@ kord({
     }
 
     mpPosting = true
+    mpCancelRequested = false
     try {
       await m.send(`_Posting *${toPost.length}* item(s) to *${groups.length}* group(s)... this is slow on purpose to avoid bans._`)
 
@@ -2344,8 +2454,11 @@ kord({
       let skipped = 0
       let consecutiveFails = 0
       let aborted = false
+      let cancelled = false
 
-      for (let ii = 0; ii < toPost.length && !aborted; ii++) {
+      outer: for (let ii = 0; ii < toPost.length; ii++) {
+        if (mpCancelRequested) { cancelled = true; break }
+
         const item = toPost[ii]
         const caption = buildPostCaption(item)
 
@@ -2362,6 +2475,8 @@ kord({
         const isPlainTextRequest = item.type === "request" && !files.length && !!caption
 
         for (let gi = 0; gi < groups.length; gi++) {
+          if (mpCancelRequested) { cancelled = true; break outer }
+
           const groupJid = groups[gi]
           try {
             if (isPlainTextRequest) {
@@ -2385,7 +2500,7 @@ kord({
             consecutiveFails++
             if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
               aborted = true
-              break
+              break outer
             }
           }
 
@@ -2399,14 +2514,113 @@ kord({
 
       let msg = `✓ Posting done\n_Success: ${success}_\n_Failed: ${fail}_`
       if (skipped) msg += `\n_Skipped (nothing to send): ${skipped}_`
+      if (cancelled) msg += `\n\n⏹ _Cancelled by request._`
       if (aborted) msg += `\n\n⚠ _Stopped early after ${MAX_CONSECUTIVE_FAILS} failures in a row. Check your connection/groups and try again later._`
       if (leftover) msg += `\n\n_${leftover} item(s) not posted (max ${MAX_ITEMS_PER_RUN} per run). Run *${prefix}mppost go* again later._`
       return await m.send(msg)
     } finally {
       mpPosting = false
+      mpCancelRequested = false
     }
   } catch (e) {
     console.log("mppost error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPCANCEL (shortcut for "mppost cancel")
+kord({
+  cmd: "mpcancel",
+  desc: "Cancel a posting run in progress",
+  fromMe: true,
+  type: "marketplace",
+}, async (m) => {
+  try {
+    if (!mpPosting) return await m.send("_No posting run in progress_")
+    mpCancelRequested = true
+    return await m.send("_Cancelling after the current send finishes..._")
+  } catch (e) {
+    console.log("mpcancel error", e)
+    return await m.sendErr(e)
+  }
+})
+
+// MPBROADCAST — one message + one group-status update, to saved (or targeted) groups
+kord({
+  cmd: "mpbroadcast|mpbc",
+  desc: "Send one message and one group status update to saved (or targeted) groups",
+  fromMe: true,
+  type: "marketplace",
+}, async (m, text) => {
+  try {
+    const { text: cleanedText, groups: targetGroups } = await extractTargetClause(m.client, text || "")
+    const arg = cleanedText.trim()
+
+    const groups = targetGroups || await loadGroups()
+    if (!groups.length) {
+      return await m.send(targetGroups
+        ? "_Couldn't resolve a group from that JID/link_"
+        : "_No groups saved. Use *mpgadd* first_")
+    }
+
+    const listings = await loadListings()
+    const maybeId = cleanId(arg)
+    const existing = arg && listings[maybeId] ? listings[maybeId] : null
+
+    let files = []
+    let caption = ""
+
+    if (existing) {
+      files = await resolveItemMedia(existing)
+      caption = existing.caption || ""
+    } else if (hasMediaInput(m)) {
+      files = await downloadMedia(m)
+      caption = arg || m.quoted?.text || ""
+    } else {
+      caption = arg
+    }
+
+    if (!files.length && !caption) {
+      return await m.send(
+        `_Usage:_\n` +
+        `*${prefix}mpbroadcast Your text* — text only\n` +
+        `_Reply to a photo/video with *${prefix}mpbroadcast caption*_\n` +
+        `*${prefix}mpbroadcast SUSYY* — broadcast an existing listing\n` +
+        `_Add " to JID/link" to target one group, e.g. *${prefix}mpbroadcast SUSYY to 1203xxx@g.us*_`
+      )
+    }
+
+    await m.send(`_Broadcasting to *${groups.length}* group(s) — message + group status..._`)
+
+    let msgOk = 0, msgFail = 0, statusOk = 0, statusFail = 0
+
+    for (let gi = 0; gi < groups.length; gi++) {
+      const groupJid = groups[gi]
+
+      try {
+        const sentIds = await sendPost(m.client, groupJid, files, caption)
+        if (existing) await recordSent(existing.id, sentIds)
+        msgOk++
+      } catch (e) {
+        console.log(`mpbroadcast message fail ${groupJid}:`, e.message)
+        msgFail++
+      }
+
+      try {
+        await sendGroupStatus(m.client, groupJid, { files, caption })
+        statusOk++
+      } catch (e) {
+        console.log(`mpbroadcast status fail ${groupJid}:`, e.message)
+        statusFail++
+      }
+
+      if (gi < groups.length - 1) await sleep(randomBetween(GROUP_DELAY))
+    }
+
+    let msg = `✓ Broadcast done\n_Message — sent: ${msgOk}, failed: ${msgFail}_\n_Group status — sent: ${statusOk}, failed: ${statusFail}_`
+    return await m.send(msg)
+  } catch (e) {
+    console.log("mpbroadcast error", e)
     return await m.sendErr(e)
   }
 })
