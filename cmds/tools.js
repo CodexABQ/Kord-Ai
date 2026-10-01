@@ -12,6 +12,7 @@ commands,
 wtype,
 prefix,
 getData,
+Baileys,
 storeData,
 changeFont,
 formatTime,
@@ -653,7 +654,7 @@ _*Avaliable Ooptions:*_
 \`.areact status\` (to view rhe settings for the present chat)`)
     }
             } else {
-m.send(`_*Avaliable Options:*_
+m.send(`_*Avaliable Opptions:*_
 \`.areact on\` (to turn on for the present chat)
 \`.areact on global\` global (to turn on for all chats)
 \`.areact off\` (to turn off for the present chat)
