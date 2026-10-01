@@ -645,7 +645,7 @@ kord({
     } else {
       m.send(`_*Choose A Valid Option!!*_
       
-_*Avaliable Options:*_
+_*Avaliable Ooptions:*_
 \`.areact on\` (to turn on for the present chat)
 \`.areact on global\` global (to turn on for all chats)
 \`.areact off\` (to turn off for the present chat)
