@@ -803,7 +803,7 @@ const INACTIVE_DAYS = 3
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000 // hourly
 
 // ── Anti-ban settings for mppost (tweak to taste) ────────
-const MAX_ITEMS_PER_RUN = 10          // max items posted per "mppost go"
+const MAX_ITEMS_PER_RUN = 30          // max items posted per "mppost go"
 const MAX_MEDIA_PER_POST = 10         // max media per album (WhatsApp album limit is 10)
 const MEDIA_DELAY = [2500, 4500]      // ms between media in the same post
 const GROUP_DELAY = [8000, 15000]     // ms between groups
