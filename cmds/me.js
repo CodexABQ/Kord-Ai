@@ -554,7 +554,7 @@ cmd: "repo|sc|script",
   try {
     const msg =
     `╔═════《 My Repository 》═════╗
-╠ Link: https://github.com/M3264/Kord-Ai
+╠ Link: https://github.com/CodexABQ/Kord-Ai
 ╠ Description: WhatsApp Bot built with Baileys
 ╚═════════════════════════════╝`
     

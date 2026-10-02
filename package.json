@@ -10,15 +10,15 @@
     "stop": "npx pm2 stop kord-ai"
   },
   "repository": {
-    "type": "git",
-    "url": "git+https://github.com/M3264/Kord-Ai.git"
-  },
+  "type": "git",
+  "url": "git+https://github.com/CodexABQ/Kord-Ai.git"
+},
   "keywords": [
     "whatsapp-bot"
   ],
   "author": "M3264",
   "license": "MIT",
-  "homepage": "https://github.com/M3264/Kord-Ai#readme",
+  "homepage": "https://github.com/CodexABQ/Kord-Ai#readme", 
   "dependencies": {
     "@mistralai/mistralai": "^1.15.1",
     "axios": "^0.27.2",

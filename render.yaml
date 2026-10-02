@@ -1,7 +1,7 @@
 services:
   - type: web
     name: kord-bot
-    repo: https://github.com/M3264/Kord-Ai.git
+    repo: https://github.com/CodexABQ/Kord-Ai.git
     branch: master
     env: docker
     dockerfilePath: Dockerfile
