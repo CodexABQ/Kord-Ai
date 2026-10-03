@@ -644,7 +644,7 @@ kord({
       var sactiveChats = sactifChat.has(m.chat)
       await m.send(`_*AUto React Settings*_\n\n\`\`\`Active: ${actif}\nGlobal?: ${sglobal}\nActive Here?:${sactiveChats}\`\`\``)
     } else {
-      m.send(`_*Choose A Valid Option!!*_
+      m.send(`_*Choose A Valid Ooption!!*_
       
 _*Avaliable Ooptions:*_
 \`.areact on\` (to turn on for the present chat)
