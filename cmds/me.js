@@ -39,7 +39,7 @@ cmd: 'ping',
     const msg = await m.send("```pinging...```");
     const end = performance.now();
     const ping = Math.round(end - start);
-    msg.edit(`々 Pong! ${ping}ms..`);
+    msg.edit(`𓁹 Pong! ${ping}ms..`);
   } catch (e) {
     console.log("cmd error", e)
     return await m.sendErr(e)
