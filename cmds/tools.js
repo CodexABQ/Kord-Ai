@@ -2722,3 +2722,233 @@ kord({
   }
 })
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* 
+ * Anti-View Once
+ * Auto saves View Once messages to Owner DM silently
+ */
+
+const {
+  kord,
+  prefix,
+  getData,
+  storeData,
+  config,
+} = require("../core")
+
+// ====================== STORAGE ======================
+async function getAntiVV() {
+  return (await getData("antivv_settings")) || {
+    allGroups: false,
+    allDMs: false,
+    chats: {} // jid: true/false
+  }
+}
+
+async function saveAntiVV(data) {
+  await storeData("antivv_settings", data)
+}
+
+function getOwnerJid() {
+  const num = (config().OWNER_NUMBER || "").toString().replace(/[^0-9]/g, "")
+  return num ? num + "@s.whatsapp.net" : null
+}
+
+// ====================== CHECK IF ENABLED ======================
+async function isAntiVVEnabled(m) {
+  const data = await getAntiVV()
+  const jid = m.chat
+
+  // Per-chat override has highest priority
+  if (data.chats[jid] !== undefined) {
+    return data.chats[jid] === true
+  }
+
+  // Global toggles
+  if (m.isGroup) return data.allGroups === true
+  return data.allDMs === true
+}
+
+// ====================== SAVE VIEW ONCE ======================
+async function saveViewOnce(m) {
+  const owner = getOwnerJid()
+  if (!owner) return
+
+  try {
+    // Detect View Once
+    const isViewOnce =
+      m.viewOnce ||
+      m.message?.viewOnceMessage ||
+      m.message?.viewOnceMessageV2 ||
+      m.message?.viewOnceMessageV2Extension ||
+      m.mtype?.includes("viewOnce") ||
+      m.quoted?.viewOnce
+
+    if (!isViewOnce) return
+
+    // Get the actual message content
+    let msg = m.message?.viewOnceMessage?.message ||
+              m.message?.viewOnceMessageV2?.message ||
+              m.message?.viewOnceMessageV2Extension?.message ||
+              m.message
+
+    // Prefer quoted if user replied, but for auto we use the message itself
+    const target = m
+
+    let buffer
+    try {
+      buffer = await target.download()
+    } catch (e) {
+      await m.client.sendMessage(owner, {
+        text: `⚠️ AntiVV Error\nFailed to download View Once\nFrom: ${m.pushName || m.sender}\nChat: \( {m.chat}\n \){e.message}`
+      })
+      return
+    }
+
+    if (!buffer) {
+      await m.client.sendMessage(owner, {
+        text: `⚠️ AntiVV\nEmpty media from View Once\nFrom: ${m.pushName || m.sender}`
+      })
+      return
+    }
+
+    // Detect type
+    let type = "image"
+    if (target.video || target.mtype?.includes("video")) type = "video"
+    else if (target.audio || target.mtype?.includes("audio")) type = "audio"
+
+    const senderName = m.pushName || m.sender.split("@")[0]
+    const chatName = m.isGroup ? (await m.client.groupMetadata(m.chat).catch(() => null))?.subject || m.chat : "Private Chat"
+
+    await m.client.sendMessage(owner, {
+      [type]: buffer,
+      caption: `📥 *Anti View Once*\n\nFrom: ${senderName}\nChat: ${chatName}\nType: ${type}`
+    })
+
+  } catch (e) {
+    const owner = getOwnerJid()
+    if (owner) {
+      await m.client.sendMessage(owner, {
+        text: `⚠️ AntiVV Critical Error\n${e.message}`
+      }).catch(() => {})
+    }
+    console.log("antivv error:", e)
+  }
+}
+
+// ====================== COMMANDS ======================
+kord({
+  cmd: "antivv|antiviewonce",
+  desc: "Anti View Once controls",
+  fromMe: true,
+  type: "owner",
+}, async (m, text) => {
+  try {
+    const arg = (text || "").trim().toLowerCase()
+    const data = await getAntiVV()
+    const jid = m.chat
+
+    // Status
+    if (!arg || arg === "status") {
+      const current = await isAntiVVEnabled(m)
+      return m.send(
+`\`\`\`┌─ Anti View Once
+│
+│ Current Chat: ${current ? "ON" : "OFF"}
+│ All Groups : ${data.allGroups ? "ON" : "OFF"}
+│ All DMs    : ${data.allDMs ? "ON" : "OFF"}
+│
+│ Commands:
+│ ${prefix}antivv on/off          - this chat
+│ ${prefix}antivv allgroups on/off
+│ ${prefix}antivv alldm on/off
+│ ${prefix}antivv status
+└────────────\`\`\``
+      )
+    }
+
+    // Toggle current chat
+    if (arg === "on") {
+      data.chats[jid] = true
+      await saveAntiVV(data)
+      return m.send("```✓ Anti View Once enabled in this chat```")
+    }
+
+    if (arg === "off") {
+      data.chats[jid] = false
+      await saveAntiVV(data)
+      return m.send("```✓ Anti View Once disabled in this chat```")
+    }
+
+    // All Groups
+    if (arg === "allgroups on") {
+      data.allGroups = true
+      await saveAntiVV(data)
+      return m.send("```✓ Anti View Once enabled for ALL groups```")
+    }
+    if (arg === "allgroups off") {
+      data.allGroups = false
+      await saveAntiVV(data)
+      return m.send("```✓ Anti View Once disabled for ALL groups```")
+    }
+
+    // All DMs
+    if (arg === "alldm on" || arg === "alldms on") {
+      data.allDMs = true
+      await saveAntiVV(data)
+      return m.send("```✓ Anti View Once enabled for ALL DMs```")
+    }
+    if (arg === "alldm off" || arg === "alldms off") {
+      data.allDMs = false
+      await saveAntiVV(data)
+      return m.send("```✓ Anti View Once disabled for ALL DMs```")
+    }
+
+    return m.send(`_*Invalid option*_\nUse: ${prefix}antivv status`)
+  } catch (e) {
+    console.log(e)
+    return m.sendErr(e)
+  }
+})
+
+// ====================== LISTENER (Silent) ======================
+kord({
+  on: "all",
+}, async (m) => {
+  try {
+    if (m.fromMe) return
+
+    // Only process possible view once messages
+    const possible =
+      m.viewOnce ||
+      m.message?.viewOnceMessage ||
+      m.message?.viewOnceMessageV2 ||
+      m.message?.viewOnceMessageV2Extension ||
+      (m.mtype && m.mtype.includes("viewOnce"))
+
+    if (!possible) return
+
+    const enabled = await isAntiVVEnabled(m)
+    if (!enabled) return
+
+    // Save silently (no reply, no react in original chat)
+    await saveViewOnce(m)
+
+  } catch (e) {
+    console.log("antivv listener error:", e)
+  }
+})
